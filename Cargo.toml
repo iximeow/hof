@@ -1,0 +1,47 @@
+[package]
+name = "hofvarpnir"
+version = "0.1.0"
+authors = ["iximeow <me@iximeow.net>"]
+edition = "2021"
+description = "files. data. thingys"
+
+[lib]
+
+[workspace]
+members = [
+    "hof-cli",
+#    "hof-db",
+]
+
+[dependencies]
+byteorder = "1.3.2"
+axum = { version = "*" }
+axum-extra = { version = "*", features = ["async-read-body"] }
+axum-server = { version = "*", features = ["tls-rustls"] }
+libc = "*"
+lazy_static = "*"
+serde = "*"
+serde_derive = "*"
+serde_json = "*"
+rand = "*"
+tokio = { version = "*", features = ["full"] }
+tokio-stream = "*"
+hyper = "*"
+futures-util = "*"
+axum-macros = "*"
+lettre = "*"
+base64 = "*"
+tracing = "*"
+tracing-subscriber = "*"
+http-body = "*"
+rusqlite = "*"
+http = "*"
+hmac = "*"
+hex = "*"
+digest = "*"
+sha2 = "*"
+sha1 = "*"
+md-5 = "*"
+reqwest = { version = "*", features = ["rustls-tls-native-roots"] }
+clap = { version = "4", features = ["derive"] }
+chrono = "*"

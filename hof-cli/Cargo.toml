@@ -1,0 +1,14 @@
+[package]
+name = "hof-cli"
+version = "0.1.0"
+authors = ["iximeow <me@iximeow.net>"]
+edition = "2021"
+description = "files thingy cli"
+
+[[bin]]
+name = "hof"
+path = "src/main.rs"
+
+[dependencies]
+hofvarpnir = { path = ".." }
+clap = { version = "4", features = ["derive"] }
