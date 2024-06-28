@@ -47,6 +47,7 @@ struct ReplicaPath(String);
 /// note: disk/volume names are not attached to hostnames because disks can move between hosts.
 struct StorageMedium(String);
 
+#[derive(Debug)]
 pub struct TagId(pub u64);
 
 enum TagValue {
@@ -63,6 +64,7 @@ pub struct Tag {
     pub value: Option<String>,
 }
 
+#[derive(Debug)]
 pub struct TagFilter {
     pub key: TagId,
     pub values: Option<HashSet<String>>,
@@ -218,7 +220,7 @@ mod db {
 
                 prepared_subqueries.push(tag_query);
             }
-            let filter = prepared_subqueries.join(" and ");
+            let filter = prepared_subqueries.join(" OR ");
             let query = format!("select file_id from file_tags where {} group by file_id having count(*)={}", filter, tags.len());
             let params = rusqlite::params_from_iter(params);
             let mut stmt = conn.prepare(&query)

@@ -199,6 +199,9 @@ async fn handle_search_tags(State(ctx): State<WebserverState>, RawQuery(q): RawQ
     html.push_str("<html>\n");
     html.push_str("  <body>\n");
     html.push_str(&format!("  <h2>results: {}</h2>\n", results.len()));
+    let mut tags: HashMap<String, HashSet<String>> = HashMap::new();
+
+    let mut result_html = String::new();
     for result in results.iter() {
         let desc = match ctx.dbctx.db.describe_file(*result) {
             Ok(desc) => desc,
@@ -208,23 +211,55 @@ async fn handle_search_tags(State(ctx): State<WebserverState>, RawQuery(q): RawQ
             }
         };
 
-        html.push_str(&format!("    <p>file {}</p>\n", result));
-        html.push_str("<pre>");
-        write!(html, "  sha256: {}\n", desc.sha256.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
-        write!(html, "replicas:\n");
+        result_html.push_str(&format!("    <p>file {}</p>\n", result));
+        result_html.push_str("<pre>");
+        write!(result_html, "  sha256: {}\n", desc.sha256.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
+        write!(result_html, "replicas:\n");
         for replica in desc.replicas.iter() {
-            write!(html, "  {}: {}, checked {}", replica.who, replica.replica, replica.last_check_ts);
+            write!(result_html, "  {}: {}, checked {}", replica.who, replica.replica, replica.last_check_ts);
             if replica.valid {
-                write!(html, " (valid)");
+                write!(result_html, " (valid)");
             }
-            html.push_str("\n");
+            result_html.push_str("\n");
         }
-        write!(html, "tags:\n");
+        write!(result_html, "tags:\n");
         for tag in desc.tags.iter() {
-            writeln!(html, "  {}: {}, from {}", tag.name, tag.value, tag.source);
+            tags.entry(tag.name.clone()).or_default()
+                .insert(tag.value.clone());
+            writeln!(result_html, "  {}: {}, from {}", tag.name, tag.value, tag.source);
         }
-        html.push_str("</pre>");
+        result_html.push_str("</pre>");
     }
+
+    let mut tag_names: Vec<&str> = tags.keys().map(|x| x.as_str()).collect();
+    tag_names.sort();
+
+    let mut tag_summary = String::new();
+    tag_summary.push_str("  <p>tags in result set:</p>\n");
+    for tag in tag_names {
+        write!(tag_summary, "<p><a href=\"/tags/search?{q}&{tag}\">{tag}</a>: ");
+        let mut values = tags.get(tag).expect("tag is still present")
+            .iter().map(|x| x.as_str()).collect::<Vec<&str>>();
+        values.sort();
+        if (values.len() as f64 / (results.len() as f64) < 0.05) || (values.len() < 20) {
+            let mut first = true;
+            for v in values {
+                if !first {
+                    tag_summary.push_str(", ");
+                } else {
+                    first = false;
+                }
+                write!(tag_summary, "<a href=\"/tags/search?{q}&{tag}={v}\">{v}</a>");
+            }
+        } else {
+            write!(tag_summary, "&lt;{} values&gt;", values.len());
+        }
+        write!(tag_summary, "</p>\n");
+    }
+
+    html.push_str(&tag_summary);
+    html.push_str(&result_html);
+
     html.push_str("  </body>\n");
     html.push_str("</html>\n");
 
