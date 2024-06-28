@@ -1,0 +1,28 @@
+[package]
+name = "hof-web"
+version = "0.1.0"
+authors = ["iximeow <me@iximeow.net>"]
+edition = "2021"
+description = "files thingy webbed siht"
+
+[[bin]]
+name = "hof-web"
+path = "src/main.rs"
+
+[dependencies]
+hofvarpnir = { path = ".." }
+clap = { version = "4", features = ["derive"] }
+hex = "*"
+tokio = { version = "*", features = ["full"] }
+tokio-stream = "*"
+serde_json = "*"
+serde = { version = "*", features = ["derive"] }
+axum-server = { version = "*", features = ["tls-rustls"] }
+axum-extra = { version = "*", features = ["async-read-body"] }
+axum = "*"
+hmac = "*"
+http = "*"
+chrono = "*"
+lazy_static = "*"
+tracing-subscriber = "*"
+tracing = "*"

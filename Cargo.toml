@@ -10,6 +10,7 @@ description = "files. data. thingys"
 [workspace]
 members = [
     "hof-cli",
+    "hof-web",
 #    "hof-db",
 ]
 

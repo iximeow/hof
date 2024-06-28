@@ -675,7 +675,30 @@ name = "hof-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "hex",
  "hofvarpnir",
+]
+
+[[package]]
+name = "hof-web"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "axum-extra",
+ "axum-server",
+ "chrono",
+ "clap",
+ "hex",
+ "hmac",
+ "hofvarpnir",
+ "http",
+ "lazy_static",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

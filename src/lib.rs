@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
 
@@ -62,6 +63,11 @@ pub struct Tag {
     pub value: Option<String>,
 }
 
+pub struct TagFilter {
+    pub key: TagId,
+    pub values: Option<HashSet<String>>,
+}
+
 trait TagSource {
     fn compute_tags(f: File) -> Vec<Tag>;
 }
@@ -97,9 +103,9 @@ mod db {
 
         pub struct Description {
             pub file_id: u64,
-            pub sha256: String,
-            pub sha1: String,
-            pub md5: String,
+            pub sha256: Option<String>,
+            pub sha1: Option<String>,
+            pub md5: Option<String>,
             pub replicas: Vec<Replica>,
             pub tags: Vec<Tag>,
         }
@@ -124,7 +130,13 @@ mod db {
         pub fn create_tables(&self) -> Result<(), ()> {
             let conn = self.conn.lock().unwrap();
             conn.execute("\
-                CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, sha256 TEXT, sha1 TEXT, md5 TEXT, UNIQUE(sha256, sha1, md5));", params![]).unwrap();
+                CREATE TABLE IF NOT EXISTS files (\
+                    id INTEGER PRIMARY KEY, \
+                    sha256 TEXT, sha1 TEXT, md5 TEXT, \
+                    UNIQUE(sha256) ON CONFLICT ABORT, \
+                    UNIQUE(sha1) ON CONFLICT ABORT, \
+                    UNIQUE(md5) ON CONFLICT ABORT
+                );", params![]).unwrap();
             conn.execute("\
                 CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY, name TEXT, UNIQUE(name));", params![]).unwrap();
             conn.execute("\
@@ -136,6 +148,28 @@ mod db {
                 CREATE TABLE IF NOT EXISTS file_tags (id INTEGER PRIMARY KEY, tag INTEGER, file_id INTEGER, source INTEGER, value TEXT);", params![]).unwrap();
             conn.execute("\
                 CREATE TABLE IF NOT EXISTS replicas (id INTEGER PRIMARY KEY, file_id INTEGER, who TEXT, replica TEXT, valid TINYINT, last_check INTEGER);", params![]).unwrap();
+            // each replica exists somewhere, replica_host describes a somewhere.
+            // replica hosts might be a directory on a host, a disk, an ID for removable storage
+            // (such as a disk), an s3, digitalocean, backblaze bucket name, a hostname, who knows.
+            //
+            // "name" is a human-readable name to summarize the replica host, "description" is a
+            // secondary field if more expansive text is appropriate.
+            //
+            // "style" and "location" work together to describe the mechanics of the replica: how
+            // it is accessed, how the presence of contents should be validated, if it can be read
+            // or written to, if it should be synced to or from, etc
+            //
+            // for example, `"style=filesystem,ssh@iximeow,net@midgard.iximeow.net",
+            // "location=midgard:/zfs18t/astro/indexed" describes a replica rooted at
+            // /zfs18t/astro/indexed on the host `midgard`. it is accessible via filesystem (if the
+            // local machine is "midgard"), ssh (if it is not), and via internet through the name
+            // `midgard.iximeow.net`. these are tried in order. how to address a replica depends on
+            // the mechanism it is being accessed through.
+            //
+            // this isn't expressive enough! unfortunate. figure this out at some point. maybe each
+            // replica needs a list of "access mechanism" or something..?
+            conn.execute("\
+                CREATE TABLE IF NOT EXISTS replica_host (id INTEGER PRIMARY KEY, name TEXT, style TEXT, description TEXT, location TEXT);", params![]).unwrap();
 
             conn.execute("\
                 CREATE TABLE IF NOT EXISTS acls (id INTEGER PRIMARY KEY, rule TEXT);", params![]).unwrap();
@@ -144,7 +178,12 @@ mod db {
             Ok(())
         }
 
-        pub fn select_by_tags<'query>(&'query self, tags: &[crate::Tag]) -> Result<Vec<u64>, String> {
+        pub fn select_by_tags<'query>(&'query self, tags: &[crate::TagFilter]) -> Result<Vec<u64>, String> {
+            // TODO: extremely simple query logic:
+            // * accept multiple tags, multiple values for each tag
+            // * results are all files with at least the listed tags, where for each tag the file has least
+            // one value matching a searched-for value
+
             // realistically "select by []" could be made to make sense by using a different query
             // below, but at that point you want "select all files" anyway. so just error early.
             if tags.len() == 0 {
@@ -153,16 +192,33 @@ mod db {
 
             let conn = self.conn.lock().unwrap();
             let mut params = Vec::new();
-            let mut prepared_tags = Vec::new();
-            for (i, tag) in tags.iter().enumerate() {
-                if let Some(value) = tag.value.as_ref() {
-                    prepared_tags.push(format!("(tag={} and value=?{})", tag.key.0, i + 1));
-                    params.push(tag.value.clone());
+            let mut prepared_subqueries = Vec::new();
+            for tag_filter in tags.iter() {
+                let mut tag_query: String;
+
+                if let Some(filters) = tag_filter.values.as_ref() {
+                    let mut additional_filter = false;
+                    tag_query = String::new();
+                    tag_query.push_str("(");
+
+                    for item in filters.iter() {
+                        if additional_filter {
+                            tag_query.push_str(" OR ");
+                        } else {
+                            additional_filter = true;
+                        }
+                        use std::fmt::Write;
+                        write!(tag_query, "(tag={} and value=?{})", tag_filter.key.0, params.len() + 1);
+                        params.push(item.to_owned());
+                    }
+                    tag_query.push_str(")");
                 } else {
-                    prepared_tags.push(format!("(tag={})", tag.key.0));
+                    tag_query = format!("(tag={})", tag_filter.key.0);
                 }
+
+                prepared_subqueries.push(tag_query);
             }
-            let filter = prepared_tags.join(" or ");
+            let filter = prepared_subqueries.join(" and ");
             let query = format!("select file_id from file_tags where {} group by file_id having count(*)={}", filter, tags.len());
             let params = rusqlite::params_from_iter(params);
             let mut stmt = conn.prepare(&query)
@@ -270,6 +326,7 @@ mod db {
         pub fn add_tag(&self, file_id: u64, tag_id: u64, value: &str) -> Result<(), String> {
             let conn = self.conn.lock().unwrap();
             // we'll be simply trusting this replica to be added is currently valid...
+            // TODO: reject duplicate tags from the same source?
             let _rows_modified = conn.execute(
                 "insert into file_tags (file_id, tag, source, value) values (?1, ?2, ?3, ?4);",
                 params![file_id, tag_id, 1, value]
@@ -278,7 +335,7 @@ mod db {
             Ok(())
         }
 
-        pub fn add_replica(&self, file_id: u64, host: &str, replica_path: &str) -> Result<(), ()> {
+        pub fn add_replica(&self, file_id: u64, host: &str, replica_path: Option<&str>) -> Result<(), ()> {
             use std::time::{SystemTime, UNIX_EPOCH};
 
             let conn = self.conn.lock().unwrap();
@@ -293,10 +350,10 @@ mod db {
             Ok(())
         }
 
-        pub fn add_file(&self, hashes: &crate::file::Hashes) -> Result<FileAddResult, ()> {
-            let md5 = hex::encode(&hashes.md5);
-            let sha1 = hex::encode(&hashes.sha1);
-            let sha256 = hex::encode(&hashes.sha256);
+        pub fn add_file(&self, hashes: &crate::file::MaybeHashes) -> Result<FileAddResult, ()> {
+            let md5 = hashes.md5.as_ref().map(hex::encode);
+            let sha1 = hashes.sha1.as_ref().map(hex::encode);
+            let sha256 = hashes.sha256.as_ref().map(hex::encode);
 
             let conn = self.conn.lock().unwrap();
             let rows_modified = conn.execute(
@@ -322,7 +379,7 @@ mod db {
 
             let mut selected_tags: Vec<u64> = Vec::new();
 
-            let (sha256, sha1, md5): (String, String, String) = conn.query_row(
+            let (sha256, sha1, md5): (Option<String>, Option<String>, Option<String>) = conn.query_row(
                 "select sha256, sha1, md5 from files where id=?1;",
                 params![file_id],
                 |row| {
@@ -393,7 +450,7 @@ mod db {
     }
 }
 
-mod file {
+pub mod file {
     use digest::Digest;
     use sha2::Sha256;
     use sha1::Sha1;
@@ -403,6 +460,46 @@ mod file {
         pub sha256: [u8; 32],
         pub sha1: [u8; 20],
         pub md5: [u8; 16],
+    }
+
+    impl Hashes {
+        pub fn as_maybe_hashes(self) -> MaybeHashes {
+            let Self {
+                sha256,
+                sha1,
+                md5,
+            } = self;
+
+            MaybeHashes {
+                sha256: Some(sha256),
+                sha1: Some(sha1),
+                md5: Some(md5),
+            }
+        }
+    }
+
+    pub struct MaybeHashes {
+        pub sha256: Option<[u8; 32]>,
+        pub sha1: Option<[u8; 20]>,
+        pub md5: Option<[u8; 16]>,
+    }
+
+    impl MaybeHashes {
+        pub fn new(
+            sha256: Option<[u8; 32]>,
+            sha1: Option<[u8; 20]>,
+            md5: Option<[u8; 16]>,
+        ) -> Result<Self, ()> {
+            if sha256.is_none() && sha1.is_none() && md5.is_none() {
+                Err(())
+            } else {
+                Ok(MaybeHashes {
+                    sha256,
+                    sha1,
+                    md5,
+                })
+            }
+        }
     }
 
     pub fn hashes(file: &mut std::fs::File) -> Result<Hashes, String> {
@@ -452,7 +549,9 @@ impl Hof {
         let mut file = File::open(path).map_err(|e| format!("{}", e))?;
 
         let hashes = file::hashes(&mut file)?;
-        let file_id = match self.db.add_file(&hashes).map_err(|e| format!("err adding new file hash: {:?}", e))? {
+        // TODO: do not actually create a new file when hashes indicates we already know the file;
+        // in that cae we should only add a new local replica...
+        let file_id = match self.db.add_file(&hashes.as_maybe_hashes()).map_err(|e| format!("err adding new file hash: {:?}", e))? {
             FileAddResult::New(file_id) => {
                 file_id
             }
@@ -464,7 +563,23 @@ impl Hof {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| format!("cannot canonicalize {}: {:?}", path.display(), e))?;
 
-        self.db.add_replica(file_id, "localhost", &format!("{}", canonical.display())).expect("can add replica");
+        self.db.add_replica(file_id, "localhost", Some(&format!("{}", canonical.display()))).expect("can add replica");
+        Ok(())
+    }
+
+    pub fn add_remote_file(&self, hashes: crate::file::MaybeHashes, remote: String, path: Option<String>) -> Result<(), String> {
+        // TODO: do not actually create a new file when hashes indicates we already know the file;
+        // in that case we should only add a new replica..
+        let file_id = match self.db.add_file(&hashes).map_err(|e| format!("err adding new file hash: {:?}", e))? {
+            FileAddResult::New(file_id) => {
+                file_id
+            }
+            FileAddResult::Exists(file_id) => {
+                file_id
+            }
+        };
+
+        self.db.add_replica(file_id, &remote, path.as_ref().map(|x| x.as_str())).expect("can add replica");
         Ok(())
     }
 
