@@ -586,7 +586,8 @@ impl Hof {
     }
 
     pub fn hash_lookup(&self, sha256: &str) -> Result<Option<u64>, String> {
-        self.db.find_file(sha256)
+        let sha256 = sha256.to_owned().to_lowercase();
+        self.db.find_file(&sha256)
     }
 
     pub fn replica_lookup(&self, replica: &str, path: &str) -> Result<Option<u64>, String> {
