@@ -102,9 +102,13 @@ fn main() {
             println!("  md5:    {}", desc.md5.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
             println!("replicas:");
             for replica in desc.replicas.iter() {
-                print!("  {}: {}, checked {}", replica.who, replica.replica, replica.last_check_ts);
-                if replica.valid {
-                    print!(" (valid)");
+                if let Some(replica_name) = replica.replica.as_ref() {
+                    print!("  {}: {}, checked {}", replica.who, replica_name, replica.last_check_ts);
+                    if replica.valid {
+                        print!(" (valid)");
+                    }
+                } else {
+                    print!("  {}: remote", replica.who);
                 }
                 println!("");
             }
@@ -190,9 +194,13 @@ fn main() {
                 println!("  md5:    {}", desc.md5.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
                 println!("replicas:");
                 for replica in desc.replicas.iter() {
-                    print!("  {}: {}, checked {}", replica.who, replica.replica, replica.last_check_ts);
-                    if replica.valid {
-                        print!(" (valid)");
+                    if let Some(replica_name) = replica.replica.as_ref() {
+                        print!("  {}: {}, checked {}", replica.who, replica_name, replica.last_check_ts);
+                        if replica.valid {
+                            print!(" (valid)");
+                        }
+                    } else {
+                        print!("  {}: remote", replica.who);
                     }
                     println!("");
                 }

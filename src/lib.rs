@@ -92,7 +92,9 @@ mod db {
     mod data {
         pub struct Replica {
             pub who: String,
-            pub replica: String,
+            // we may know someone has the file by some name, but not who or where. retain the name
+            // for tracking purposes, but this is basically a dead reference..
+            pub replica: Option<String>,
             pub valid: bool,
             pub last_check_ts: u64,
         }
@@ -408,7 +410,7 @@ mod db {
                 .map_err(|e| format!("unable to prepare query: {:?}", e))?;
             let mut rows = stmt.query_map(params![file_id], |row| {
                 let who: String = row.get(0).unwrap();
-                let replica: String = row.get(1).unwrap();
+                let replica: Option<String> = row.get(1).unwrap();
                 let valid: bool = row.get(2).unwrap();
                 let last_check: u64 = row.get(3).unwrap();
                 Ok((who, replica, valid, last_check))
