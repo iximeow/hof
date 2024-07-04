@@ -84,12 +84,20 @@ trait Database {
     fn add_tag(&self, hash: String, tag: Tag) -> Result<(), ()>;
 }
 
+pub use db::data::{Description, PathLookup};
+
 mod db {
     use rusqlite::{params, Connection, OptionalExtension};
     use std::path::Path;
     use std::sync::Mutex;
 
-    mod data {
+    pub mod data {
+        pub enum PathLookup {
+            Exact(String),
+            Prefix(String),
+            Suffix(String),
+            Contains(String),
+        }
         pub struct Replica {
             pub who: String,
             // we may know someone has the file by some name, but not who or where. retain the name
@@ -238,6 +246,8 @@ mod db {
             Ok(selected_files)
         }
 
+        /// find a file at path `path` in replica `replica`. because this is exact on both
+        /// parameters, either there is one result or no result.
         pub fn replica_lookup(&self, replica: &str, path: &str) -> Result<Option<u64>, String> {
             let conn = self.conn.lock().unwrap();
             Ok(conn.query_row(
@@ -245,6 +255,51 @@ mod db {
                 params![replica, path],
                 |row| { row.get(0) }
             ).optional().unwrap())
+        }
+
+        /// find a file related to path `path`, optionally constraining results to those in replica
+        /// `replica`.
+        pub fn path_lookup(&self, replica: Option<&str>, lookup: data::PathLookup) -> Result<Vec<u64>, String> {
+            let (lookup_part, param) = match lookup {
+                data::PathLookup::Exact(path) => {
+                    ("replica=?1", path)
+                },
+                data::PathLookup::Prefix(prefix) => {
+                    ("replica like ?1", format!("{prefix}%"))
+                },
+                data::PathLookup::Suffix(suffix) => {
+                    ("replica like ?1", format!("%{suffix}"))
+                },
+                data::PathLookup::Contains(substr) => {
+                    ("replica like ?1", format!("%{substr}%"))
+                },
+            };
+
+            let mut params = vec![param];
+
+            let mut query = format!("select file_id from replicas where {lookup_part}");
+            if let Some(replica) = replica {
+                query.push_str(" and who=?2");
+                params.push(replica.to_owned());
+            }
+            query.push_str(" group by file_id");
+            query.push_str(";");
+
+            let conn = self.conn.lock().unwrap();
+            eprintln!("query: {}", query);
+            eprintln!("params: {:?}", params);
+            let params = rusqlite::params_from_iter(params);
+            let mut stmt = conn.prepare(query.as_str())
+                .map_err(|e| format!("unable to prepare query: {:?}", e))?;
+            let mut rows = stmt.query_map(params, |row| row.get(0))
+                .map_err(|e| format!("unable to execute query: {:?}", e))?;
+
+            let mut selected_files: Vec<u64> = Vec::new();
+            for file_id in rows {
+                let file_id = file_id.map_err(|e| format!("failed to iterate row: {}", e))?;
+                selected_files.push(file_id);
+            }
+            Ok(selected_files)
         }
 
         pub fn find_file(&self, sha256: &str) -> Result<Option<u64>, String> {
@@ -339,8 +394,23 @@ mod db {
             Ok(())
         }
 
-        pub fn add_replica(&self, file_id: u64, host: &str, replica_path: Option<&str>) -> Result<(), ()> {
+        pub fn remote_is_known(&self, host: &str) -> bool {
+            let conn = self.conn.lock().unwrap();
+            // "select who from replicas where who="?1" group by who
+            let query = "select who from replicas where who=\"?1\" group by who;";
+            conn.query_row(
+                query,
+                params![host],
+                |row| { Ok(row.get::<usize, String>(0)) }
+            ).optional().unwrap().is_some()
+        }
+
+        pub fn add_replica(&self, file_id: u64, host: Option<&str>, replica_path: Option<&str>) -> Result<(), ()> {
             use std::time::{SystemTime, UNIX_EPOCH};
+
+            if host == None && replica_path == None {
+                panic!("use `add_file` to add a reference to a file known only by a hash, unavailable to the local machine");
+            }
 
             let conn = self.conn.lock().unwrap();
             // we'll be simply trusting this replica to be added is currently valid...
@@ -567,11 +637,12 @@ impl Hof {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| format!("cannot canonicalize {}: {:?}", path.display(), e))?;
 
-        self.db.add_replica(file_id, "localhost", Some(&format!("{}", canonical.display()))).expect("can add replica");
+        // TODO: use gethostname
+        self.db.add_replica(file_id, Some("localhost"), Some(&format!("{}", canonical.display()))).expect("can add replica");
         Ok(())
     }
 
-    pub fn add_remote_file(&self, hashes: crate::file::MaybeHashes, remote: String, path: Option<String>) -> Result<(), String> {
+    pub fn add_remote_file(&self, hashes: crate::file::MaybeHashes, remote: Option<String>, path: Option<String>) -> Result<(), String> {
         // TODO: do not actually create a new file when hashes indicates we already know the file;
         // in that case we should only add a new replica..
         let file_id = match self.db.add_file(&hashes).map_err(|e| format!("err adding new file hash: {:?}", e))? {
@@ -583,7 +654,11 @@ impl Hof {
             }
         };
 
-        self.db.add_replica(file_id, &remote, path.as_ref().map(|x| x.as_str())).expect("can add replica");
+        self.db.add_replica(
+            file_id,
+            remote.as_ref().map(|x| x.as_str()),
+            path.as_ref().map(|x| x.as_str())
+        ).expect("can add replica");
         Ok(())
     }
 

@@ -26,7 +26,10 @@ enum Command {
 
     /// add a file known by some hashes, held by some remote
     AddRemoteFile {
-        remote: String,
+        #[clap(long)]
+        remote: Option<String>,
+        #[clap(long)]
+        allow_new_remote: bool,
         #[clap(long)]
         path: Option<String>,
         #[clap(long)]
@@ -52,9 +55,30 @@ enum Command {
 
     SearchTags { tags: Vec<String> },
 
+    /// find files with `part` in their name.
     SearchPath {
-        replica: String,
-        prefix: String
+        /// which replica do we care about results in? default: any
+        #[clap(long)]
+        replica: Option<String>,
+        /// must files exactly end with the path `path` to be printed? or is containing `path` in
+        /// the path string sufficient?
+        #[clap(short, long, action)]
+        exact: bool,
+        /// some fragment of a path to find in known files. if not exact, `path` must only be a
+        /// substring of a file path for it to be included in the results.
+        path: String
+    },
+
+    /// list all files known to be at or under a provided path, if any
+    ListPath {
+        #[clap(long)]
+        replica: Option<String>,
+        #[clap(short, long, action)]
+        exact: bool,
+        /// some prefix of a path to list files under. if exact, `prefix` must begin a replica's
+        /// path to be included in the result set. otherwise, `prefix` may exist anywhere in a
+        /// replica's path to be included in the result set.
+        prefix: String,
     },
 
     Describe {
@@ -96,26 +120,7 @@ fn main() {
 
             let desc = hof.db.describe_file(id).expect("can describe file");
 
-            println!("file {}", desc.file_id);
-            println!("  sha256: {}", desc.sha256.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
-            println!("  sha1:   {}", desc.sha1.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
-            println!("  md5:    {}", desc.md5.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
-            println!("replicas:");
-            for replica in desc.replicas.iter() {
-                if let Some(replica_name) = replica.replica.as_ref() {
-                    print!("  {}: {}, checked {}", replica.who, replica_name, replica.last_check_ts);
-                    if replica.valid {
-                        print!(" (valid)");
-                    }
-                } else {
-                    print!("  {}: remote", replica.who);
-                }
-                println!("");
-            }
-            println!("tags:");
-            for tag in desc.tags.iter() {
-                println!("  {}: {}, from {}", tag.name, tag.value, tag.source);
-            }
+            print_description(&desc);
         },
         Command::AddFile { what, recursive } => {
             match recursive {
@@ -127,7 +132,16 @@ fn main() {
                 }
             }
         },
-        Command::AddRemoteFile { remote, path, sha256, sha1, md5 } => {
+        Command::AddRemoteFile { remote, allow_new_remote, path, sha256, sha1, md5 } => {
+            // check if the remote seems new, if so then double-check that a new remote is actually
+            // requested.
+
+            if let Some(remote) = remote.as_ref() {
+                if !hof.db.remote_is_known(remote.as_str()) && !allow_new_remote {
+                    panic!("remote {} is not known and --new-remote was not passed: assuming this remote is incorrect", remote);
+                }
+            }
+
             hof.add_remote_file(hofvarpnir::file::MaybeHashes::new(
                 sha256.map(hex::decode).map(|v| {
                     *TryInto::<&[u8; 32]>::try_into(v.expect("TODO: ok").as_slice()).expect("TODO: right size")
@@ -217,8 +231,35 @@ fn main() {
         },
         Command::SearchPath {
             replica,
+            exact,
+            path
+        } => {
+            use hofvarpnir::PathLookup;
+
+            let replica = replica.as_ref().map(|x| x.as_str()); //unwrap_or_else(|| gethostname::gethostname());
+            let results = if exact {
+                hof.db.path_lookup(
+                    replica,
+                    PathLookup::Suffix(path),
+                )
+            } else {
+                hof.db.path_lookup(
+                    replica,
+                    PathLookup::Contains(path),
+                )
+            };
+            let results = results.expect("can query");
+            for id in results.into_iter() {
+                let desc = hof.db.describe_file(id).expect("can describe");
+                print_description(&desc);
+            }
+        },
+        Command::ListPath {
+            replica,
+            exact,
             prefix
         } => {
+//            hof.db.select_from_replica_
             panic!("search path");
         },
     }
@@ -278,4 +319,28 @@ fn index_tree(hof: Hof, root: String) {
     }
 
     println!("[+] indexed {}!", root);
+}
+
+
+fn print_description(desc: &hofvarpnir::Description) {
+    println!("file {}", desc.file_id);
+    println!("  sha256: {}", desc.sha256.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
+    println!("  sha1:   {}", desc.sha1.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
+    println!("  md5:    {}", desc.md5.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
+    println!("replicas:");
+    for replica in desc.replicas.iter() {
+        if let Some(replica_name) = replica.replica.as_ref() {
+            print!("  {}: {}, checked {}", replica.who, replica_name, replica.last_check_ts);
+            if replica.valid {
+                print!(" (valid)");
+            }
+        } else {
+            print!("  {}: remote", replica.who);
+        }
+        println!("");
+    }
+    println!("tags:");
+    for tag in desc.tags.iter() {
+        println!("  {}: {}, from {}", tag.name, tag.value, tag.source);
+    }
 }
