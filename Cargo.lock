@@ -723,6 +723,7 @@ dependencies = [
  "lazy_static",
  "lettre",
  "libc",
+ "libsqlite3-sys",
  "md-5",
  "rand",
  "reqwest",

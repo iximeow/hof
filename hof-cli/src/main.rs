@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 use std::collections::HashSet;
+use std::fmt;
 use std::path::PathBuf;
 
 use hofvarpnir::Hof;
@@ -82,11 +83,30 @@ enum Command {
     },
 
     Describe {
-        what: String,
+        #[clap(long)]
+        category: Option<ItemCategory>,
 
-        #[clap(long, short, action, default_value_t = false)]
-        by_id: bool
+        what: String,
     },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum ItemCategory {
+    Path,
+    Hash,
+    Id,
+}
+
+impl fmt::Display for ItemCategory {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let label = match self {
+            ItemCategory::Path => { "path" },
+            ItemCategory::Hash => { "hash" },
+            ItemCategory::Id => { "id" },
+        };
+
+        f.write_str(label)
+    }
 }
 
 fn main() {
@@ -97,25 +117,40 @@ fn main() {
     let hof = Hof::new(db_path);
 
     match args.command {
-        Command::Describe { what, by_id } => {
-            let id = if by_id {
-                let id: u64 = what.parse().expect("TODO: handle non-int \"id\"");
-                id
-            } else {
-                let id = if let Some(id) = hof.hash_lookup(&what).expect("TODO: can do db query") {
-                    Some(id)
-                } else {
+        Command::Describe { category, what } => {
+            let id = match category {
+                Some(ItemCategory::Path) => {
                     hof.replica_lookup("localhost", &what).expect("TODO: can do db query")
-                };
-
-                let id = match id {
-                    Some(id) => id,
-                    None => {
-                        panic!("item {} is not known", what);
+                },
+                Some(ItemCategory::Hash) => {
+                    hof.hash_lookup(&what).expect("TODO: can do db query")
+                },
+                Some(ItemCategory::Id) => {
+                    let id: u64 = what.parse().expect("TODO: handle non-int \"id\"");
+                    Some(id)
+                },
+                None => {
+                    // we don't know if the provided thing is a hash, file path, or id. the user
+                    // hasn't suggested one way or the other. try a hash lookup, assume it might be
+                    // a file path if not.
+                    if let Some(id) = hof.hash_lookup(&what).expect("TODO: can do db query") {
+                        Some(id)
+                    } else {
+                        hof.replica_lookup("localhost", &what).expect("TODO: can do db query")
                     }
-                };
+                }
+            };
 
-                id
+            let id = match id {
+                Some(id) => id,
+                None => {
+                    if let Some(category) = category {
+                        eprintln!("no {} tracked as {}", category, what);
+                    } else {
+                        eprintln!("{} is not a known path or hash", what);
+                    }
+                    std::process::exit(1);
+                }
             };
 
             let desc = hof.db.describe_file(id).expect("can describe file");
@@ -209,12 +244,18 @@ fn main() {
                 println!("replicas:");
                 for replica in desc.replicas.iter() {
                     if let Some(replica_name) = replica.replica.as_ref() {
-                        print!("  {}: {}, checked {}", replica.who, replica_name, replica.last_check_ts);
-                        if replica.valid {
-                            print!(" (valid)");
+                        if let Some(who) = replica.who.as_ref() {
+                            print!("  {}: {}, checked {}", who, replica_name, replica.last_check_ts);
+                            if replica.valid {
+                                print!(" (valid)");
+                            }
+                        } else {
+                            print!("  <unknown>: {}", replica_name);
                         }
+                    } else if let Some(replica_who) = replica.who.as_ref() {
+                        print!("  {}: remote", replica_who);
                     } else {
-                        print!("  {}: remote", replica.who);
+                        print!("  <unknown>");
                     }
                     println!("");
                 }
@@ -330,12 +371,18 @@ fn print_description(desc: &hofvarpnir::Description) {
     println!("replicas:");
     for replica in desc.replicas.iter() {
         if let Some(replica_name) = replica.replica.as_ref() {
-            print!("  {}: {}, checked {}", replica.who, replica_name, replica.last_check_ts);
-            if replica.valid {
-                print!(" (valid)");
+            if let Some(who) = replica.who.as_ref() {
+                print!("  {}: {}, checked {}", who, replica_name, replica.last_check_ts);
+                if replica.valid {
+                    print!(" (valid)");
+                }
+            } else {
+                print!("  <unknown>: {}", replica_name);
             }
+        } else if let Some(replica_who) = replica.who.as_ref() {
+            print!("  {}: remote", replica_who);
         } else {
-            print!("  {}: remote", replica.who);
+            print!("  <unknown>");
         }
         println!("");
     }

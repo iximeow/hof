@@ -29,10 +29,15 @@ struct FileId(u64);
 /// }
 /// ```
 struct Replica {
-    // who has it?
-    who: String,
-    // and where do they think it is?
-    path: ReplicaPath,
+    // who has it? these two fields are optional because it is possible we know about a file
+    // without being able to say where it is or who might have it. this is uncommon... it's also
+    // probably the case that for such a file there simply should not be a replica recorded, and
+    // any information about the file's theorized location somewhere should be retained as a tag on
+    // the file instead.
+    who: Option<String>,
+    // and where do they think it is? again, optional because we may only know where the file
+    // exists, or we may not even know where to find it, just that something exists.
+    path: Option<ReplicaPath>,
 }
 
 /// the path to a replica of some data. its exact meaning depends on the replica processing this
@@ -99,7 +104,12 @@ mod db {
             Contains(String),
         }
         pub struct Replica {
-            pub who: String,
+            // who has it? these two fields are optional because it is possible we know about a file
+            // without being able to say where it is or who might have it. this is uncommon... it's also
+            // probably the case that for such a file there simply should not be a replica recorded, and
+            // any information about the file's theorized location somewhere should be retained as a tag on
+            // the file instead.
+            pub who: Option<String>,
             // we may know someone has the file by some name, but not who or where. retain the name
             // for tracking purposes, but this is basically a dead reference..
             pub replica: Option<String>,
@@ -397,7 +407,7 @@ mod db {
         pub fn remote_is_known(&self, host: &str) -> bool {
             let conn = self.conn.lock().unwrap();
             // "select who from replicas where who="?1" group by who
-            let query = "select who from replicas where who=\"?1\" group by who;";
+            let query = "select who from replicas where who=?1 group by who;";
             conn.query_row(
                 query,
                 params![host],
@@ -430,20 +440,44 @@ mod db {
             let sha256 = hashes.sha256.as_ref().map(hex::encode);
 
             let conn = self.conn.lock().unwrap();
-            let rows_modified = conn.execute(
+            match conn.execute(
                 "insert into files (sha256, sha1, md5) values (?1, ?2, ?3);",
-                params![sha256, sha1, md5]
-            ).unwrap();
-
-            if rows_modified == 1 {
-                Ok(FileAddResult::New(conn.last_insert_rowid() as u64))
-            } else {
-                let res = conn.query_row(
-                    "select id from files where sha256=?1 and sha1=?2 and md5=?3",
-                    params![&sha256, sha1, md5],
-                    |row| { row.get(0) }
-                ).unwrap();
-                Ok(FileAddResult::Exists(res))
+                params![sha256.as_ref(), sha1.as_ref(), md5.as_ref()]
+            ) {
+                Ok(1) => {
+                    Ok(FileAddResult::New(conn.last_insert_rowid() as u64))
+                },
+                Ok(other) => {
+                    // TODO: pretty severe logical error here..
+                    panic!("how did inserting one row succeed but instead insert {} rows?", other);
+                }
+                // UNIQUE constraint violated. so one of these hashes already exist.
+                // TODO: try updating the matching hash's row to the other provided hashes?
+                Err(rusqlite::Error::SqliteFailure(libsqlite3_sys::Error {
+                    code: libsqlite3_sys::ErrorCode::ConstraintViolation,
+                    extended_code: 2067
+                }, _)) => {
+                    // ok, so the hash already exists. look it up and return that id.
+                    // note: `sha256 OR sha1 OR md5` - any of the hashes may be the one that was
+                    // present and conflicted, the local addition may provide hashes that were not
+                    // yet known. selecting on all hashes we were just told may be overly
+                    // restrictive.
+                    let res = conn.query_row(
+                        "select id from files where sha256=?1 or sha1=?2 or md5=?3",
+                        params![&sha256, sha1, md5],
+                        |row| { row.get(0) }
+                    ).unwrap();
+                    Ok(FileAddResult::Exists(res))
+                },
+                Err(other) => {
+                    panic!(
+                        "unexpected error inserting hashes {{ sha256: {}, sha1: {}, md5: {} }}: {:?}",
+                        sha256.as_ref().map(|x| x.as_str()).unwrap_or("<none>"),
+                        sha1.as_ref().map(|x| x.as_str()).unwrap_or("<none>"),
+                        md5.as_ref().map(|x| x.as_str()).unwrap_or("<none>"),
+                        other
+                    );
+                }
             }
         }
 
@@ -479,7 +513,7 @@ mod db {
             let mut stmt = conn.prepare("select who, replica, valid, last_check from replicas where file_id=?1;")
                 .map_err(|e| format!("unable to prepare query: {:?}", e))?;
             let mut rows = stmt.query_map(params![file_id], |row| {
-                let who: String = row.get(0).unwrap();
+                let who: Option<String> = row.get(0).unwrap();
                 let replica: Option<String> = row.get(1).unwrap();
                 let valid: bool = row.get(2).unwrap();
                 let last_check: u64 = row.get(3).unwrap();
@@ -654,11 +688,14 @@ impl Hof {
             }
         };
 
-        self.db.add_replica(
-            file_id,
-            remote.as_ref().map(|x| x.as_str()),
-            path.as_ref().map(|x| x.as_str())
-        ).expect("can add replica");
+        if remote.is_some() || path.is_some() {
+            self.db.add_replica(
+                file_id,
+                remote.as_ref().map(|x| x.as_str()),
+                path.as_ref().map(|x| x.as_str())
+            ).expect("can add replica");
+        }
+
         Ok(())
     }
 
