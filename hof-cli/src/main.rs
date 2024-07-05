@@ -344,10 +344,13 @@ fn index_tree(hof: Hof, root: String) {
                     };
                     match entry.file_type() {
                         Ok(t) if t.is_dir() => {
+                            println!("discovered dir {}", entry.path().display());
                             worklist.push(entry.path());
                         }
                         Ok(t) if t.is_file() => {
                             print!("indexing {}... ", entry.path().display());
+                            use std::io::Write;
+                            std::io::stdout().flush().expect("can flush");
                             let start = Instant::now();
                             hof.add_file(entry.path()).expect("can index file");
                             println!("done in {:0.2}ms", start.elapsed().as_micros() as f64 / 1000.0);
