@@ -185,6 +185,7 @@ async fn handle_search_tags(State(ctx): State<WebserverState>, RawQuery(q): RawQ
 
     let tag_list: Vec<hofvarpnir::TagFilter> = search.details.into_values().collect();
 
+    eprintln!("search: {:?}", tag_list);
     let results = match ctx.dbctx.db.select_by_tags(&tag_list) {
         Ok(results) => results,
         Err(e) => {

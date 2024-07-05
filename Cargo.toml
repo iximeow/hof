@@ -47,3 +47,4 @@ md-5 = "*"
 reqwest = { version = "*", features = ["rustls-tls-native-roots"] }
 clap = { version = "4", features = ["derive"] }
 chrono = "*"
+gethostname = "0.4.3"

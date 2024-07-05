@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use hofvarpnir::Hof;
 
@@ -315,7 +316,11 @@ fn index_tree(hof: Hof, root: String) {
     match std::fs::metadata(&root) {
         Ok(md) => {
             if md.is_file() {
-                panic!("indexing a file?");
+                print!("indexing {}... ", root.as_str());
+                let start = Instant::now();
+                hof.add_file(root.as_str()).expect("can index file");
+                println!("done in {:0.2}ms", start.elapsed().as_micros() as f64 / 1000.0);
+                return;
             } else if md.is_dir() {
                 worklist.push(PathBuf::from(&root));
             } else {
@@ -342,7 +347,10 @@ fn index_tree(hof: Hof, root: String) {
                             worklist.push(entry.path());
                         }
                         Ok(t) if t.is_file() => {
-                            println!("indexing {}", entry.path().display());
+                            print!("indexing {}... ", entry.path().display());
+                            let start = Instant::now();
+                            hof.add_file(entry.path()).expect("can index file");
+                            println!("done in {:0.2}ms", start.elapsed().as_micros() as f64 / 1000.0);
                         }
                         Ok(_) => {
                             panic!("what is {}?", entry.path().display());

@@ -13,3 +13,4 @@ path = "src/main.rs"
 hofvarpnir = { path = ".." }
 clap = { version = "4", features = ["derive"] }
 hex = "*"
+gethostname = "0.4.3"

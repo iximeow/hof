@@ -242,6 +242,7 @@ mod db {
             }
             let filter = prepared_subqueries.join(" OR ");
             let query = format!("select file_id from file_tags where {} group by file_id having count(*)={}", filter, tags.len());
+            eprintln!("query: {}", query);
             let params = rusqlite::params_from_iter(params);
             let mut stmt = conn.prepare(&query)
                 .map_err(|e| format!("unable to prepare query: {:?}", e))?;
@@ -423,15 +424,42 @@ mod db {
             }
 
             let conn = self.conn.lock().unwrap();
-            // we'll be simply trusting this replica to be added is currently valid...
-            let mut stmt = conn.prepare(
-                "insert into replicas (file_id, who, replica, valid, last_check) values (?1, ?2, ?3, ?4, ?5);"
-            ).expect("can prepare statement");
-            let rows_modified = stmt
-                .execute(params![file_id, host, replica_path, 1, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()]).unwrap();
-            assert_eq!(rows_modified, 1);
+            // see if (host, replica_path) is already tracked as some replica. if it is, we're
+            // really just refreshing the last check of that replica. otherwise, add a new one.
 
-            Ok(())
+            let replica_id: Option<u64> = conn.query_row(
+                "select id from replicas where file_id=?1 and who=?2 and replica=?3;",
+                params![file_id, host, replica_path],
+                |row| { row.get(0) }
+            ).optional().unwrap();
+
+            let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+            match replica_id {
+                Some(id) => {
+                    // this is the "just update it" case
+                    let rows_modified = conn.prepare(
+                        "update replicas set last_check=?1, valid=1 where id=?2;"
+                    ).expect("can prepare statement")
+                        .execute(params![now_ts, id]).unwrap();
+                    assert_eq!(rows_modified, 1);
+
+                    Ok(())
+                },
+                None => {
+                    // it seems like a totally new edition of the file, add a new replica
+
+                    // we'll be simply trusting this replica to be added is currently valid...
+                    let mut stmt = conn.prepare(
+                        "insert into replicas (file_id, who, replica, valid, last_check) values (?1, ?2, ?3, ?4, ?5);"
+                    ).expect("can prepare statement");
+                    let rows_modified = stmt
+                        .execute(params![file_id, host, replica_path, 1, now_ts]).unwrap();
+                    assert_eq!(rows_modified, 1);
+
+                    Ok(())
+                }
+            }
         }
 
         pub fn add_file(&self, hashes: &crate::file::MaybeHashes) -> Result<FileAddResult, ()> {
@@ -671,8 +699,10 @@ impl Hof {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| format!("cannot canonicalize {}: {:?}", path.display(), e))?;
 
-        // TODO: use gethostname
-        self.db.add_replica(file_id, Some("localhost"), Some(&format!("{}", canonical.display()))).expect("can add replica");
+        let hostname: String = gethostname::gethostname()
+            .into_string()
+            .expect("hostname is a valid utf8 string ????? look i know this isn't guaranteed but come on");
+        self.db.add_replica(file_id, Some(hostname.as_str()), Some(&format!("{}", canonical.display()))).expect("can add replica");
         Ok(())
     }
 
