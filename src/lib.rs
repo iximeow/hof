@@ -161,8 +161,6 @@ mod db {
                 );", params![]).unwrap();
             conn.execute("\
                 CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY, name TEXT, UNIQUE(name));", params![]).unwrap();
-            conn.execute("\
-                CREATE TABLE IF NOT EXISTS tag_source (id INTEGER PRIMARY KEY, name TEXT);", params![]).unwrap();
             // a record of which tag sources have processed a file (and when)
             conn.execute("\
                 CREATE TABLE IF NOT EXISTS tag_log (id INTEGER PRIMARY KEY, file_id INTEGER, source INTEGER, state INTEGER, version INTEGER, tag_time INTEGER);", params![]).unwrap();
@@ -197,7 +195,72 @@ mod db {
                 CREATE TABLE IF NOT EXISTS acls (id INTEGER PRIMARY KEY, rule TEXT);", params![]).unwrap();
             conn.execute("\
                 CREATE TABLE IF NOT EXISTS file_acls (id INTEGER PRIMARY KEY, file_id INTEGER, rule INTEGER);", params![]).unwrap();
+            conn.execute("\
+                CREATE TABLE IF NOT EXISTS tag_worklist (id INTEGER PRIMARY KEY, file_id INTEGER, source_id INTEGER, generator_state INTEGER, tag_time INTEGER);", params![]).unwrap();
+            conn.execute("\
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tag_worklist_state ON tag_worklist (file_id, source_id);", params![]).unwrap();
+            conn.execute("\
+                CREATE TABLE IF NOT EXISTS tag_sources (id INTEGER PRIMARY KEY, name TEXT, version INTEGER);", params![]).unwrap();
+            conn.execute("\
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tag_sources ON tag_sources (name, version);", params![]).unwrap();
             Ok(())
+        }
+
+        pub fn get_tag_generator_id(&self, name: &str, version: u64) -> Result<Option<u64>, String> {
+            let conn = self.conn.lock().unwrap();
+            Ok(conn.query_row(
+                "select id from tag_sources where name=?1 and version=?2",
+                params![name, version],
+                |row| { row.get(0) }
+            ).optional().unwrap())
+        }
+
+        pub fn create_tag_generator_id(&self, name: &str, version: u64) -> Result<u64, String> {
+            let conn = self.conn.lock().unwrap();
+            let insert_res = conn.execute(
+                "insert into tag_sources (name, version) values (?1, ?2);",
+                params![name, version]
+            );
+
+            match insert_res {
+                Ok(1) => {
+                    // inserted onw item, so that's the new id.
+                    Ok(conn.last_insert_rowid() as u64)
+                }
+                Ok(rows) => {
+                    unreachable!("attempted to insert one row, actually inserted .... {} ???", rows);
+                }
+                Err(rusqlite::Error::SqliteFailure(sql_err, _)) if sql_err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                    Ok(conn.query_row(
+                        "select id from tag_sources where name=?1 and version=?2",
+                        params![name, version],
+                        |row| { row.get(0) }
+                    ).unwrap())
+                }
+                Err(e) => {
+                    panic!("unexpected err: {:?}", e);
+                }
+            }
+        }
+
+        // TODO: theoretically this doesn't need to construct a full vec of ids, but to do
+        // concurrent queries i'd need to pass the locked connection around(?) or maybe have
+        // multiple database connections..
+        //
+        // this won't survive having tens of millions of files. alas.
+        pub fn tag_worklist(&self, source_id: Option<u64>) -> Result<Vec<u64>, String> {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare("select files.id from files left join tag_worklist on files.id=tag_worklist.file_id where (tag_worklist.source_id=?1 and tag_worklist.generator_state=0) or tag_worklist.generator_state is null or files.id not in (select file_id from tag_worklist where source_id=?1) group by files.id;")
+                .expect("can prepare query");
+            let mut rows = stmt.query_map(params![source_id], |row| row.get(0))
+                .map_err(|e| format!("unable to execute query: {:?}", e))?;
+
+            let mut worklist: Vec<u64> = Vec::new();
+            for file_id in rows {
+                let file_id = file_id.map_err(|e| format!("failed to iterate row: {}", e))?;
+                worklist.push(file_id);
+            }
+            Ok(worklist)
         }
 
         pub fn select_by_tags<'query>(&'query self, tags: &[crate::TagFilter]) -> Result<Vec<u64>, String> {
@@ -558,10 +621,10 @@ mod db {
                 });
             }
 
-            let mut stmt = conn.prepare("select tags.name, file_tags.value, tag_source.name \
+            let mut stmt = conn.prepare("select tags.name, file_tags.value, tag_sources.name \
                 from file_tags \
                     join tags on tags.id=file_tags.tag \
-                    join tag_source on file_tags.source=tag_source.id \
+                    join tag_sources on file_tags.source=tag_sources.id \
                     where file_tags.file_id=?1 \
                     order by tags.id,file_tags.value;")
                 .map_err(|e| format!("unable to prepare query: {:?}", e))?;
@@ -741,19 +804,24 @@ impl Hof {
         self.db.replica_lookup(replica, &canonical)
     }
 
-    pub fn add_tag(&self, sha256: &str, key: &str, value: &str) -> Result<(), String> {
+    pub fn add_tag(&self, sha256: &str, source: u64, key: &str, value: &str) -> Result<(), String> {
         let file_id = self.db.find_file(sha256).and_then(|r| {
             r.ok_or_else(|| format!("hash {} is not known", sha256))
         })?;
 
-        self.add_file_tag(file_id, key, value)
+        self.add_file_tag(file_id, source, key, value)
     }
 
-    pub fn add_file_tag(&self, file_id: u64, key: &str, value: &str) -> Result<(), String> {
+    pub fn add_file_tag(&self, file_id: u64, source: u64, key: &str, value: &str) -> Result<(), String> {
         let tag_id = self.db.create_tag(key).map_err(|e| format!("failed to create tag {}: {}", key, e))?;
 
-        self.db.add_tag(file_id, tag_id, value)?;
+        self.db.add_tag(file_id, source, tag_id, value)?;
 
         Ok(())
     }
+}
+
+use std::time::{SystemTime, UNIX_EPOCH};
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).expect("now is later than epoch").as_millis() as u64
 }
