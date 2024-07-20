@@ -304,7 +304,7 @@ mod db {
                 prepared_subqueries.push(tag_query);
             }
             let filter = prepared_subqueries.join(" OR ");
-            let query = format!("select file_id from file_tags where {} group by file_id having count(*)={}", filter, tags.len());
+            let query = format!("select file_id from file_tags where {} group by file_id, tag having count(distinct tag)={}", filter, tags.len());
             eprintln!("query: {}", query);
             let params = rusqlite::params_from_iter(params);
             let mut stmt = conn.prepare(&query)
@@ -318,6 +318,15 @@ mod db {
                 selected_files.push(file_id);
             }
             Ok(selected_files)
+        }
+
+        pub fn find_local_replica(&self, remote: &str, file_id: u64) -> Result<Option<String>, String> {
+            let conn = self.conn.lock().unwrap();
+            Ok(conn.query_row(
+                "select replica from replicas where who=?1 and file_id=?2 and valid=1",
+                params![remote, file_id],
+                |row| { row.get(0) }
+            ).optional().unwrap())
         }
 
         /// find a file at path `path` in replica `replica`. because this is exact on both
@@ -456,14 +465,25 @@ mod db {
             Ok(selected_tags)
         }
 
-        pub fn add_tag(&self, file_id: u64, tag_id: u64, value: &str) -> Result<(), String> {
+        pub fn add_tag(&self, file_id: u64, source: u64, tag_id: u64, value: &str) -> Result<(), String> {
             let conn = self.conn.lock().unwrap();
             // we'll be simply trusting this replica to be added is currently valid...
             // TODO: reject duplicate tags from the same source?
             let _rows_modified = conn.execute(
                 "insert into file_tags (file_id, tag, source, value) values (?1, ?2, ?3, ?4);",
-                params![file_id, tag_id, 1, value]
+                params![file_id, tag_id, source, value]
             ).unwrap();
+
+            Ok(())
+        }
+
+        pub fn tag_generator_state(&self, file_id: u64, generator_id: u64, state: hof_tags::TagGeneratorState) -> Result<(), String> {
+            let conn = self.conn.lock().unwrap();
+            let rows_modified = conn.prepare_cached(
+                "insert or replace into tag_worklist (id, file_id, source_id, generator_state, tag_time) values ((select id from tag_worklist where file_id=?1 and source_id=?2), ?1, ?2, ?3, ?4);",
+            ).expect("can prepare statement")
+                .execute(params![file_id, generator_id, state as u8, crate::now_ms()]).unwrap();
+            assert_eq!(rows_modified, 1);
 
             Ok(())
         }

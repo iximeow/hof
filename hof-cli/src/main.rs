@@ -192,9 +192,12 @@ fn main() {
         }
         Command::AddTag { what, tag_key, tag_value } => {
             if let Ok(Some(file_id)) = hof.hash_lookup(&what) {
-                hof.add_file_tag(file_id, &tag_key, &tag_value).expect("works");
+                // TODO:
+                // source = manual = 2
+                hof.add_file_tag(file_id, 2, &tag_key, &tag_value).expect("works");
             } else if let Ok(Some(file_id)) = hof.replica_lookup("localhost", &what) {
-                hof.add_file_tag(file_id, &tag_key, &tag_value).expect("works");
+                // source = manual = 2
+                hof.add_file_tag(file_id, 2, &tag_key, &tag_value).expect("works");
             } else {
                 panic!("unsure what {} is", what);
             }
@@ -333,6 +336,7 @@ fn index_tree(hof: Hof, root: String) {
     }
 
     while let Some(item) = worklist.pop() {
+        println!("worklist: {} dirs", worklist.len() + 1);
         match std::fs::read_dir(&item) {
             Ok(iter) => {
                 for entry in iter {
