@@ -1,0 +1,19 @@
+[package]
+name = "hof-worklist"
+version = "0.1.0"
+authors = ["iximeow <me@iximeow.net>"]
+edition = "2021"
+description = "worklist manager for hof databases"
+
+[[bin]]
+name = "hof-worklist"
+path = "src/main.rs"
+
+[dependencies]
+hofvarpnir = { path = ".." }
+clap = { version = "4", features = ["derive"] }
+hex = "*"
+gethostname = "0.4.3"
+libc = "0.2.100"
+hof-tags = { path = "../hof-tags" }
+hof-ffi = { path = "../hof-ffi" }

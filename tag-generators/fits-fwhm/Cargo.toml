@@ -1,0 +1,15 @@
+[package]
+name = "fits-fwhm"
+version = "0.1.0"
+authors = ["iximeow <me@iximeow.net>"]
+edition = "2021"
+description = "tag generator for fwhm of .fits files"
+
+[lib]
+name = "fits_fwhm"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+hof-tags = { path = "../../hof-tags" }
+regex = "*"

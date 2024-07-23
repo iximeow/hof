@@ -1,0 +1,15 @@
+[package]
+name = "binary-format-arch"
+version = "0.1.0"
+authors = ["iximeow <me@iximeow.net>"]
+edition = "2021"
+description = "tag generator for binary containers and architecture"
+
+[lib]
+name = "binary_arch_tag"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+hof-tags = { path = "../../hof-tags" }
+object = "0.36.1"

@@ -1,0 +1,15 @@
+[package]
+name = "fits-file-tag"
+version = "0.1.0"
+authors = ["iximeow <me@iximeow.net>"]
+edition = "2021"
+description = "tag generator based on file names ending in .fits"
+
+[lib]
+name = "fits_file_tag"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+hof-tags = { path = "../../hof-tags" }
+regex = "*"
