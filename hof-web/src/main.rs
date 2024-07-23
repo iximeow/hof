@@ -91,9 +91,13 @@ async fn handle_describe_file(Path(path): Path<String>, State(ctx): State<Webser
     writeln!(html, "  md5:    {}", desc.md5.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
     writeln!(html, "replicas:");
     for replica in desc.replicas.iter() {
-        write!(html,"  {}: {}, checked {}", replica.who, replica.replica, replica.last_check_ts);
-        if replica.valid {
-            write!(html, " (valid)");
+        if let (Some(who), Some(path)) = (replica.who.as_ref(), replica.replica.as_ref()) {
+            write!(html, "  {}: {}, checked {}", who, path, replica.last_check_ts);
+            if replica.valid {
+                write!(html, " (valid)");
+            }
+        } else {
+            write!(html, "  &lt;unknown&gt;");
         }
         writeln!(html, "");
     }
@@ -217,9 +221,13 @@ async fn handle_search_tags(State(ctx): State<WebserverState>, RawQuery(q): RawQ
         write!(result_html, "  sha256: {}\n", desc.sha256.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
         write!(result_html, "replicas:\n");
         for replica in desc.replicas.iter() {
-            write!(result_html, "  {}: {}, checked {}", replica.who, replica.replica, replica.last_check_ts);
-            if replica.valid {
-                write!(result_html, " (valid)");
+            if let (Some(who), Some(path)) = (replica.who.as_ref(), replica.replica.as_ref()) {
+                write!(result_html, "  {}: {}, checked {}", who, path, replica.last_check_ts);
+                if replica.valid {
+                    write!(result_html, " (valid)");
+                }
+            } else {
+                write!(result_html, "  &lt;unknown&gt;");
             }
             result_html.push_str("\n");
         }

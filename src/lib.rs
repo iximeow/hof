@@ -166,6 +166,17 @@ mod db {
                 CREATE TABLE IF NOT EXISTS tag_log (id INTEGER PRIMARY KEY, file_id INTEGER, source INTEGER, state INTEGER, version INTEGER, tag_time INTEGER);", params![]).unwrap();
             conn.execute("\
                 CREATE TABLE IF NOT EXISTS file_tags (id INTEGER PRIMARY KEY, tag INTEGER, file_id INTEGER, source INTEGER, value TEXT);", params![]).unwrap();
+            // this index is also useful for `fn tag_worklist`, specifically when a worklist may
+            // have only a few specific interesting tags
+            conn.execute("\
+                CREATE INDEX IF NOT EXISTS file_tag_sources on file_tags (tag, file_id, source);", params![]).unwrap();
+            // not immediately useful, but if `fn tag_worklist` joins on file id with no query on
+            // tags' source_id or generator_state then the lack of index is a real drag.
+            //
+            // this can end up being useful if a tag generator declares a list of interests that
+            // specifies no tags.
+            conn.execute("\
+                CREATE INDEX IF NOT EXISTS file_tag_file_ids on file_tags (file_id);", params![]).unwrap();
             conn.execute("\
                 CREATE TABLE IF NOT EXISTS replicas (id INTEGER PRIMARY KEY, file_id INTEGER, who TEXT, replica TEXT, valid TINYINT, last_check INTEGER);", params![]).unwrap();
             // each replica exists somewhere, replica_host describes a somewhere.
@@ -199,6 +210,10 @@ mod db {
                 CREATE TABLE IF NOT EXISTS tag_worklist (id INTEGER PRIMARY KEY, file_id INTEGER, source_id INTEGER, generator_state INTEGER, tag_time INTEGER);", params![]).unwrap();
             conn.execute("\
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_tag_worklist_state ON tag_worklist (file_id, source_id);", params![]).unwrap();
+            // this in particular helps calculate worklists per-tag-generator in a reasonable
+            // amount of time... (fn tag_worklist() is about 6x slower without this one)
+            conn.execute("\
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tag_worklist_state2 ON tag_worklist (file_id, source_id, generator_state);", params![]).unwrap();
             conn.execute("\
                 CREATE TABLE IF NOT EXISTS tag_sources (id INTEGER PRIMARY KEY, name TEXT, version INTEGER);", params![]).unwrap();
             conn.execute("\
@@ -248,11 +263,78 @@ mod db {
         // multiple database connections..
         //
         // this won't survive having tens of millions of files. alas.
-        pub fn tag_worklist(&self, source_id: Option<u64>) -> Result<Vec<u64>, String> {
+        pub fn tag_worklist(&self, source_id: Option<u64>, interests: Option<&[hof_ffi::Interest]>) -> Result<Vec<u64>, String> {
+            let query = if let Some(interests) = interests {
+                let mut interests_filter: Vec<String> = Vec::new();
+                let mut additional_params: Vec<String> = Vec::new();
+
+                for interest in interests.iter() {
+                    let tag_id = self.tag_to_id(interest.tag())
+                        .expect("can try finding tag");
+                    let tag_id = match tag_id {
+                        Some(id) => id,
+                        None => {
+                            eprintln!("want worklist including files tagged {}, but no such tag exists, so no file exists with it", interest.tag());
+                            return Ok(Vec::new());
+                        }
+                    };
+
+                    match (interest.value(), interest.source()) {
+                        (Some(value), Some(source)) => {
+                            let source_id = self.get_tag_generator_id(source, 1)
+                                .expect("can get source");
+                            let source_id = match source_id {
+                                Some(source_id) => source_id,
+                                None => {
+                                    return Ok(Vec::new());
+                                }
+                            };
+
+                            additional_params.push(value.to_owned());
+                            let query = format!("(file_tags.tag={} and file_tags.source={} and file_tags.value=?{})", tag_id, source_id, additional_params.len() + 1);
+                            interests_filter.push(query);
+                        },
+                        (Some(value), None) => {
+                            additional_params.push(value.to_owned());
+                            let query = format!("(file_tags.tag={} and file_tags.value=?{})", tag_id, additional_params.len() + 1);
+                            interests_filter.push(query);
+                        },
+                        (None, Some(source)) => {
+                            let source_id = self.get_tag_generator_id(source, 1)
+                                .expect("can get source");
+                            let source_id = match source_id {
+                                Some(source_id) => source_id,
+                                None => {
+                                    return Ok(Vec::new());
+                                }
+                            };
+
+                            let query = format!("(file_tags.tag={} and file_tags.source={})", tag_id, source_id);
+                            interests_filter.push(query);
+                        },
+                        (None, None) => {
+                            let query = format!("(file_tags.tag={})", tag_id);
+                            interests_filter.push(query);
+                        }
+                    }
+                }
+
+                let interests_filter = interests_filter.join(" and ");
+                let mut query = "select files.id from files left join tag_worklist on files.id=tag_worklist.file_id and tag_worklist.source_id=?1 left join file_tags on files.id=file_tags.file_id where (tag_worklist.generator_state=0 or tag_worklist.generator_state is null) and ".to_string();
+                query.push_str(&interests_filter);
+                query.push_str(";");
+
+                query
+            } else {
+                "select files.id from files left join tag_worklist on files.id=tag_worklist.file_id and tag_worklist.source_id=?1 where (tag_worklist.generator_state=0 or tag_worklist.generator_state is null);".to_owned()
+            };
+
             let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare("select files.id from files left join tag_worklist on files.id=tag_worklist.file_id where (tag_worklist.source_id=?1 and tag_worklist.generator_state=0) or tag_worklist.generator_state is null or files.id not in (select file_id from tag_worklist where source_id=?1) group by files.id;")
-                .expect("can prepare query");
-            let mut rows = stmt.query_map(params![source_id], |row| row.get(0))
+
+            let mut stmt = conn.prepare(&query)
+                    .expect("can prepare query");
+
+            let rows = stmt.query_map(params![source_id], |row| row.get(0))
                 .map_err(|e| format!("unable to execute query: {:?}", e))?;
 
             let mut worklist: Vec<u64> = Vec::new();

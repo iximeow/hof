@@ -1,0 +1,9 @@
+[package]
+name = "hof-ffi"
+version = "0.1.0"
+authors = ["iximeow <me@iximeow.net>"]
+edition = "2021"
+description = "ffi structure definitions for hof"
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,12 @@
+[package]
+name = "hof-tags"
+version = "0.1.0"
+authors = ["iximeow <me@iximeow.net>"]
+edition = "2021"
+description = "interface definitions for hof tag generators"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+hof-ffi = { path = "../hof-ffi" }

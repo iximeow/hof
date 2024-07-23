@@ -10,7 +10,13 @@ description = "files. data. thingys"
 [workspace]
 members = [
     "hof-cli",
+    "hof-ffi",
     "hof-web",
+    "hof-worklist",
+    "hof-tags",
+    "tag-generators/fits-file-tag",
+    "tag-generators/fits-fwhm",
+    "tag-generators/binary-format-arch",
 #    "hof-db",
 ]
 
@@ -48,3 +54,5 @@ reqwest = { version = "*", features = ["rustls-tls-native-roots"] }
 clap = { version = "4", features = ["derive"] }
 chrono = "*"
 gethostname = "0.4.3"
+hof-tags = { path = "./hof-tags" }
+hof-ffi = { path = "./hof-ffi" }
