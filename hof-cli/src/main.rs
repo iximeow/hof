@@ -121,7 +121,11 @@ fn main() {
         Command::Describe { category, what } => {
             let id = match category {
                 Some(ItemCategory::Path) => {
-                    hof.replica_lookup("localhost", &what).expect("TODO: can do db query")
+                    let hostname: String = gethostname::gethostname()
+                        .into_string()
+                        .expect("hostname is a valid utf8 string");
+
+                    hof.replica_lookup(&hostname, &what).expect("TODO: can do db query")
                 },
                 Some(ItemCategory::Hash) => {
                     hof.hash_lookup(&what).expect("TODO: can do db query")
@@ -137,7 +141,11 @@ fn main() {
                     if let Some(id) = hof.hash_lookup(&what).expect("TODO: can do db query") {
                         Some(id)
                     } else {
-                        hof.replica_lookup("localhost", &what).expect("TODO: can do db query")
+                        let hostname: String = gethostname::gethostname()
+                            .into_string()
+                            .expect("hostname is a valid utf8 string");
+
+                        hof.replica_lookup(&hostname, &what).expect("TODO: can do db query")
                     }
                 }
             };
@@ -195,7 +203,13 @@ fn main() {
                 // TODO:
                 // source = manual = 2
                 hof.add_file_tag(file_id, 2, &tag_key, &tag_value).expect("works");
-            } else if let Ok(Some(file_id)) = hof.replica_lookup("localhost", &what) {
+            } else if let Ok(Some(file_id)) = {
+                let hostname: String = gethostname::gethostname()
+                    .into_string()
+                    .expect("hostname is a valid utf8 string");
+
+                hof.replica_lookup(&hostname, &what)
+            } {
                 // source = manual = 2
                 hof.add_file_tag(file_id, 2, &tag_key, &tag_value).expect("works");
             } else {
