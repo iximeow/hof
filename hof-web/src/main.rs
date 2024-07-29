@@ -12,11 +12,14 @@ use axum::routing::{get, post};
 use axum::response::{Html, IntoResponse};
 use axum::extract::{Path, State, RawQuery};
 use axum::body::Body;
+use axum::body::HttpBody;
 use axum::{Error, Json};
 use axum::extract::rejection::JsonRejection;
 use axum::body::Bytes;
 use axum::http::{StatusCode, Uri};
 use http::header::HeaderMap;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use tracing::error;
 
@@ -41,9 +44,10 @@ async fn main() {
         std::fs::File::open(config_path).expect("file exists and is accessible")
     ).expect("valid json for WebserverConfig");
     let db_path = web_config.db_path.clone();
+    let incoming_dir = web_config.incoming_dir.clone();
 
     if let Some(addr_conf) = web_config.debug_addr.as_ref() {
-        tokio::spawn(bind_server(addr_conf.clone(), db_path.clone()));
+        tokio::spawn(bind_server(addr_conf.clone(), db_path.clone(), incoming_dir.clone()));
     }
 
     loop {
@@ -74,6 +78,11 @@ async fn handle_help(State(ctx): State<WebserverState>) -> impl IntoResponse {
     (StatusCode::OK, Html(resp))
 }
 
+struct FilePaths {
+    target: Option<PathBuf>,
+    interim: PathBuf,
+}
+
 async fn handle_uploaded_file(headers: HeaderMap, State(ctx): State<WebserverState>, body: axum::body::Body) -> impl IntoResponse {
     let maybe_md5 = match get_one_header(&headers, "file-md5")
         .map(|h| hex::decode(h).map(|v| TryInto::<[u8; 16]>::try_into(v))) {
@@ -102,23 +111,23 @@ async fn handle_uploaded_file(headers: HeaderMap, State(ctx): State<WebserverSta
         }
     };
 
-    let content_length: Option<u64> = match get_one_header(&headers, "content-length").map(u64::parse) {
+    let content_length: Option<u64> = match get_one_header(&headers, "content-length").map(|cl| cl.parse()) {
         Some(Ok(cl)) => {
             if cl > 1024 * 1024 * 1024 {
-                return (StatusCode::BAD_REQUEST, Html("content too large")).into_response(),
+                return (StatusCode::BAD_REQUEST, Html("content too large")).into_response();
             }
 
             Some(cl)
         }
         Some(Err(e)) => {
-            return (StatusCode::BAD_REQUEST, Html(format!("invalid content-length: {}", cl))).into_response();
+            return (StatusCode::BAD_REQUEST, Html(format!("invalid content-length: {}", e))).into_response();
         },
         None => {
-            None,
+            None
         }
     };
 
-    if let Ok(maybe_hashes) = MaybeHashes::new(maybe_sha256, maybe_sha1, maybe_md5) {
+    let maybe_hashes = if let Ok(maybe_hashes) = MaybeHashes::new(maybe_sha256, maybe_sha1, maybe_md5) {
         let hashes_id = ctx.dbctx.db.find_by_hash(&maybe_hashes);
         eprintln!("lookup result: {:?}", hashes_id);
         if let Ok(Some(id)) = hashes_id {
@@ -133,38 +142,178 @@ async fn handle_uploaded_file(headers: HeaderMap, State(ctx): State<WebserverSta
             ];
             return (StatusCode::FOUND, headers, Body::new(resp)).into_response();
         }
+        Some(maybe_hashes)
     } else {
         eprintln!("no hashes provided");
-    }
+        None
+    };
 
-    let (target_file, target_path) = match get_one_header(&headers, "file-path") {
-        Some(path) => {
+    let file_paths = match get_one_header(&headers, "file-path") {
+        Some(desired_path) => {
             // TODO: overly-broad hammer to disallow file-path doing arbitrary file writes.
             // should this be a chroot? should this be an unshare with appropriate bind mounts?
             // yes! but at the moment i am lazy AND i am the only user. so as long as i trust me to
             // not pwn myself...
-            if target_path.contains("../") || target_path.contains("..\\") || target.contains("/..") || target.contains("\\..") || target == ".." {
+            if desired_path.contains("../") || desired_path.contains("..\\") || desired_path.contains("/..") || desired_path.contains("\\..") || desired_path == ".." {
                 return (StatusCode::BAD_REQUEST, Html("file-path invalid")).into_response();
             }
 
-            let mut path = ctx.incoming_dir.clone();
-            path.push(target_path);
+            // ok: and from here the strategy is to check if the destination file already exists -
+            // doesn't really matter if it's the same or not, it's a conflict and we'll error.
+            //
+            // still: accept bytes into a temporary file and move it into place atomically once
+            // the upload is complete. this avoids interrupted uploads leaving broken files on our
+            // end.
+            //
+            // register in-progress uploads so we can clean up if we accumulate junk through
+            // interrupted uploads.
+            //
+            // in-progress file will be named `<desired_path>.hofpart`. conflict on the in-progress
+            // file name is also an error.
+            //
+            // create both files atomically to error early if either is a conflict. error
+            // resolution is a little subtle, described later.
 
-            let file = if let Ok(f) = tokio::fs::File::options().read(true).write(true).create_new(true).open(path).await {
-                f
-            } else {
-                // TODO: was the error because the file exists, or something else?
-                return StatusCode::CONFLICT.into_response();
-            };
+            let mut target_path = ctx.incoming_dir.clone();
+            target_path.push(desired_path);
 
-            (path, file)
+            let mut interim_path = target_path.clone();
+            let last_part = interim_path.pop();
+            interim_path.join(&format!("{}.hofpart", last_part));
+
+            FilePaths {
+                target: Some(target_path),
+                interim: interim_path,
+            }
         }
         None => {
+            // similar to the above, except here we don't know the destination path until the file
+            // is fully received.
+            //
+            // since the client didn't indicate a desired path, we'll just invent one from the
+            // contents' hash.
+            //
+            // don't assume the `file-{md5,sha1,sha256}` are correct, if provided. they are only
+            // used as a cross-check once the upload is complete, to validate that the content we
+            // got is what the other end expected to give us.
+            //
+            // since we don't know a desired path yet, we can't pick a good interim storage
+            // location. so use a totally random path instead, hope it all works out.
+            let interim_path = "test.hofpart".into();
+            FilePaths {
+                target: None,
+                interim: interim_path,
+            }
+        }
+    };
 
+    match save_file(body, &file_paths, maybe_hashes).await {
+        Ok(final_path) => {
+            let mut standin_final_file = match tokio::fs::File::options().read(true).write(true).create_new(true).open(&final_path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("conflict on final file, apparently we already have this? {:?}", e);
+                    return StatusCode::CONFLICT.into_response();
+                }
+            };
+            std::fs::rename(&file_paths.interim, &final_path)
+                .expect("TODO: handle rename failing after everything else succeeded");
+            // ok! we've saved the file. now we can insert it into the db...
+            ctx.dbctx.add_file(final_path)
+                .expect("can add file");
+//            eprintln!("pretend i just added {} to the db", final_path.display());
+            StatusCode::OK.into_response()
+        },
+        Err(e) => {
+            eprintln!("failed to receive file: {}", e);
+            // TODO: distinguish if it's on us or the client...
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Option<MaybeHashes>) -> Result<PathBuf, String> {
+    let mut interim_file = match tokio::fs::File::options().read(true).write(true).create_new(true).open(&paths.interim).await {
+        Ok(f) => f,
+        Err(e) => {
+            // TODO: was the error because the file exists, or something else?
+            return Err(format!("open: {:?}", e));
+        }
+    };
+    // return StatusCode::CONFLICT.into_response();
+
+    use futures::StreamExt;
+
+    let mut input_stream = body.into_data_stream();
+
+    let mut buf = [0u8; 65536];
+
+    loop {
+        match input_stream.next().await {
+            Some(Ok(b)) => {
+                match interim_file.write_all(&b).await {
+                    Ok(()) => {
+                    }
+                    Err(e) => {
+                        eprintln!("error writing to file: {:?}", e);
+                        return Err(format!("write: {:?}", e));
+                    }
+                }
+
+                if input_stream.is_end_stream() {
+                    // done reading, no error so the client fully delivered its body?
+                    break;
+                }
+            }
+            Some(Err(e)) => {
+                eprintln!("error reading from file: {:?}", e);
+                return Err(format!("read: {:?}", e));
+            }
+            None => {
+                if !input_stream.is_end_stream() {
+                    eprintln!("TODO: think this is impossible: input stream next() yielded None, but stream is not done");
+                }
+            }
         }
     }
 
-    StatusCode::OK.into_response()
+    // ok, we've stored the whole file. hash it, make sure those hashes match what we expected to
+    // get (if anything)
+    let hashes = hofvarpnir::file::hashes(&mut interim_file.into_std().await)
+        .expect("can hash what we just wrote");
+
+    if let Some(maybe_hashes) = maybe_hashes {
+        if let Some(sha256) = maybe_hashes.sha256.as_ref() {
+            if sha256 != &hashes.sha256 {
+                return Err(format!("sha256s dont match"));
+            }
+        }
+        if let Some(sha1) = maybe_hashes.sha1.as_ref() {
+            if sha1 != &hashes.sha1 {
+                return Err(format!("sha1s dont match"));
+            }
+        }
+        if let Some(md5) = maybe_hashes.md5.as_ref() {
+            if md5 != &hashes.md5 {
+                return Err(format!("md5s dont match"));
+            }
+        }
+    }
+
+    // at this point if there were hashes, they match what we got. if we didn't know a path to put
+    // this before, we can compute one: the sha256 of the file.
+    let dest_path: PathBuf = match paths.target.as_ref() {
+        Some(target) => target.clone(),
+        None => {
+            // TODO: at last split this by the first byte, or two bytes, so they all don't go in
+            // the same directory...
+            hex::encode(hashes.sha256).into()
+        }
+    };
+
+    // atomically move the interim file in place
+
+    Ok(dest_path)
 }
 
 async fn handle_download_file(Path(path): Path<String>, State(ctx): State<WebserverState>) -> impl IntoResponse {
@@ -442,9 +591,10 @@ async fn handle_tags_index(State(ctx): State<WebserverState>) -> impl IntoRespon
 #[derive(Clone)]
 struct WebserverState {
     dbctx: Arc<Hof>,
+    incoming_dir: PathBuf
 }
 
-async fn make_app_server(db_path: &PathBuf) -> Router {
+async fn make_app_server(db_path: &PathBuf, incoming_dir: PathBuf) -> Router {
     Router::new()
         .route("/", get(handle_tags_index))
         .route("/help", get(handle_help))
@@ -454,12 +604,13 @@ async fn make_app_server(db_path: &PathBuf) -> Router {
         .route("/tags/search", get(handle_search_tags))
         .fallback(fallback_get)
         .with_state(WebserverState {
-            dbctx: Arc::new(Hof::new(db_path))
+            dbctx: Arc::new(Hof::new(db_path)),
+            incoming_dir,
         })
 }
 
-async fn bind_server(conf: serde_json::Value, db_path: PathBuf) -> std::io::Result<()> {
-    let server = make_app_server(&db_path).await.into_make_service();
+async fn bind_server(conf: serde_json::Value, db_path: PathBuf, incoming_dir: PathBuf) -> std::io::Result<()> {
+    let server = make_app_server(&db_path, incoming_dir).await.into_make_service();
 
     use serde_json::Value;
     match conf {
