@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive"] }
 hex = "*"
 tokio = { version = "*", features = ["full"] }
 tokio-stream = "*"
+tokio-util = "*"
 serde_json = "*"
 serde = { version = "*", features = ["derive"] }
 axum-server = { version = "*", features = ["tls-rustls"] }
@@ -26,3 +27,4 @@ chrono = "*"
 lazy_static = "*"
 tracing-subscriber = "*"
 tracing = "*"
+gethostname = "*"

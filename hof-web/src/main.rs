@@ -1,5 +1,6 @@
 use chrono::{Utc, TimeZone};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fmt::Write;
@@ -7,9 +8,10 @@ use std::sync::Arc;
 use std::path::PathBuf;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::response::{Html, IntoResponse};
 use axum::extract::{Path, State, RawQuery};
+use axum::body::Body;
 use axum::{Error, Json};
 use axum::extract::rejection::JsonRejection;
 use axum::body::Bytes;
@@ -18,12 +20,13 @@ use http::header::HeaderMap;
 
 use tracing::error;
 
-use hofvarpnir::Hof;
+use hofvarpnir::{Hof, file::MaybeHashes};
 
 #[derive(Serialize, Deserialize)]
 struct WebserverConfig {
     debug_addr: Option<serde_json::Value>,
     db_path: PathBuf,
+    incoming_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -60,11 +63,138 @@ async fn handle_help(State(ctx): State<WebserverState>) -> impl IntoResponse {
 /help                 this help
 /                     tag list and hof index
 /file/:id             describe file :id
+/file/:id/download    download file :id
+/file/upload          POST. provide a file to be tracked by this hof. optionally provide any of its hashes as headers (file-{md5,sha1,sha256}) to allow the remote end to quickly reply if it knows the file already
+/file/report          POST. tell the remote end about a file by hashes, without providing contents
 /tags/search          search by tags (query string is a list of tag=value, tag=1&tag=2 means `tag in [1, 2]` and tag=&tag2= means `has tag 1 and tag 2`
+/tags/report          POST. tell the remote end about a file tag (file_id=XXX, tag=YYY, optional value=ZZZ)
 </pre>");
     resp.push_str("  </body>\n");
     resp.push_str("</html>\n");
     (StatusCode::OK, Html(resp))
+}
+
+async fn handle_uploaded_file(headers: HeaderMap, State(ctx): State<WebserverState>, body: axum::body::Body) -> impl IntoResponse {
+    let maybe_md5 = match get_one_header(&headers, "file-md5")
+        .map(|h| hex::decode(h).map(|v| TryInto::<[u8; 16]>::try_into(v))) {
+        Some(Ok(Ok(bytes))) => Some(bytes),
+        None => None,
+        _ => {
+            return (StatusCode::BAD_REQUEST, Html("file-md5 invalid")).into_response();
+        }
+    };
+
+    let maybe_sha1 = match get_one_header(&headers, "file-sha1")
+        .map(|h| hex::decode(h).map(|v| TryInto::<[u8; 20]>::try_into(v))) {
+        Some(Ok(Ok(bytes))) => Some(bytes),
+        None => None,
+        _ => {
+            return (StatusCode::BAD_REQUEST, Html("file-sha1 invalid")).into_response();
+        }
+    };
+
+    let maybe_sha256 = match get_one_header(&headers, "file-sha256")
+        .map(|h| hex::decode(h).map(|v| TryInto::<[u8; 32]>::try_into(v))) {
+        Some(Ok(Ok(bytes))) => Some(bytes),
+        None => None,
+        _ => {
+            return (StatusCode::BAD_REQUEST, Html("file-sha256 invalid")).into_response();
+        }
+    };
+
+    let content_length: Option<u64> = match get_one_header(&headers, "content-length").map(u64::parse) {
+        Some(Ok(cl)) => {
+            if cl > 1024 * 1024 * 1024 {
+                return (StatusCode::BAD_REQUEST, Html("content too large")).into_response(),
+            }
+
+            Some(cl)
+        }
+        Some(Err(e)) => {
+            return (StatusCode::BAD_REQUEST, Html(format!("invalid content-length: {}", cl))).into_response();
+        },
+        None => {
+            None,
+        }
+    };
+
+    if let Ok(maybe_hashes) = MaybeHashes::new(maybe_sha256, maybe_sha1, maybe_md5) {
+        let hashes_id = ctx.dbctx.db.find_by_hash(&maybe_hashes);
+        eprintln!("lookup result: {:?}", hashes_id);
+        if let Ok(Some(id)) = hashes_id {
+            let resp = json!({
+                "id": id
+            });
+            let resp = serde_json::to_string(&resp)
+                .expect("can stringify");
+
+            let headers = [
+                (http::header::CONTENT_TYPE, "application/json"),
+            ];
+            return (StatusCode::FOUND, headers, Body::new(resp)).into_response();
+        }
+    } else {
+        eprintln!("no hashes provided");
+    }
+
+    let (target_file, target_path) = match get_one_header(&headers, "file-path") {
+        Some(path) => {
+            // TODO: overly-broad hammer to disallow file-path doing arbitrary file writes.
+            // should this be a chroot? should this be an unshare with appropriate bind mounts?
+            // yes! but at the moment i am lazy AND i am the only user. so as long as i trust me to
+            // not pwn myself...
+            if target_path.contains("../") || target_path.contains("..\\") || target.contains("/..") || target.contains("\\..") || target == ".." {
+                return (StatusCode::BAD_REQUEST, Html("file-path invalid")).into_response();
+            }
+
+            let mut path = ctx.incoming_dir.clone();
+            path.push(target_path);
+
+            let file = if let Ok(f) = tokio::fs::File::options().read(true).write(true).create_new(true).open(path).await {
+                f
+            } else {
+                // TODO: was the error because the file exists, or something else?
+                return StatusCode::CONFLICT.into_response();
+            };
+
+            (path, file)
+        }
+        None => {
+
+        }
+    }
+
+    StatusCode::OK.into_response()
+}
+
+async fn handle_download_file(Path(path): Path<String>, State(ctx): State<WebserverState>) -> impl IntoResponse {
+    let file_id = if let Ok(id) = path.parse() {
+        id
+    } else {
+        return (StatusCode::BAD_REQUEST, Html("Invalid ID".to_string())).into_response();
+    };
+
+    let desc = if let Ok(description) = ctx.dbctx.db.describe_file(file_id) {
+        description
+    } else {
+        return (StatusCode::NOT_FOUND, Html("Not Found".to_string())).into_response();
+    };
+
+    let hostname = gethostname::gethostname()
+        .into_string()
+        .expect("hostname is a valid utf8 string");
+
+    for replica in desc.replicas.iter() {
+        if let Ok(file) = ctx.dbctx.open_replica(replica).await {
+            let stream = tokio_util::io::ReaderStream::new(file);
+            let headers = [
+                (http::header::CONTENT_TYPE, "application/octet-stream"),
+            ];
+            return (headers, axum::body::Body::from_stream(stream)).into_response();
+        }
+    }
+
+    (StatusCode::NOT_FOUND, Html("No replica is local and valid")).into_response()
 }
 
 async fn handle_describe_file(Path(path): Path<String>, State(ctx): State<WebserverState>) -> impl IntoResponse {
@@ -190,6 +320,8 @@ async fn handle_search_tags(State(ctx): State<WebserverState>, RawQuery(q): RawQ
     let tag_list: Vec<hofvarpnir::TagFilter> = search.details.into_values().collect();
 
     eprintln!("search: {:?}", tag_list);
+    use std::time::Instant;
+    let start = Instant::now();
     let results = match ctx.dbctx.db.select_by_tags(&tag_list) {
         Ok(results) => results,
         Err(e) => {
@@ -197,6 +329,7 @@ async fn handle_search_tags(State(ctx): State<WebserverState>, RawQuery(q): RawQ
             return (StatusCode::BAD_REQUEST, Html("<html><body>bad request, no biscuits</body></html>".to_string()))
         }
     };
+    eprintln!(" done in {}ms", start.elapsed().as_millis());
 
 //    println!("results: {:?}", results);
 
@@ -208,6 +341,7 @@ async fn handle_search_tags(State(ctx): State<WebserverState>, RawQuery(q): RawQ
 
     let mut result_html = String::new();
     for result in results.iter() {
+        let start = Instant::now();
         let desc = match ctx.dbctx.db.describe_file(*result) {
             Ok(desc) => desc,
             Err(e) => {
@@ -215,6 +349,7 @@ async fn handle_search_tags(State(ctx): State<WebserverState>, RawQuery(q): RawQ
                 return (StatusCode::BAD_REQUEST, Html("<html><body>bad request, no biscuits</body></html>".to_string()));
             }
         };
+//        eprintln!("file {} described in {}ms", result, start.elapsed().as_micros() as f64 / 1000.0);
 
         result_html.push_str(&format!("    <p>file {}</p>\n", result));
         result_html.push_str("<pre>");
@@ -272,6 +407,8 @@ async fn handle_search_tags(State(ctx): State<WebserverState>, RawQuery(q): RawQ
     html.push_str("  </body>\n");
     html.push_str("</html>\n");
 
+    eprintln!("search handled in {}ms", start.elapsed().as_micros() as f64 / 1000.0);
+
     (StatusCode::OK, Html(html))
 }
 
@@ -312,6 +449,8 @@ async fn make_app_server(db_path: &PathBuf) -> Router {
         .route("/", get(handle_tags_index))
         .route("/help", get(handle_help))
         .route("/file/:id", get(handle_describe_file))
+        .route("/file/:id/download", get(handle_download_file))
+        .route("/file/upload", post(handle_uploaded_file))
         .route("/tags/search", get(handle_search_tags))
         .fallback(fallback_get)
         .with_state(WebserverState {
@@ -332,4 +471,14 @@ async fn bind_server(conf: serde_json::Value, db_path: PathBuf) -> std::io::Resu
             panic!("invalid server configuration: {:?}", other);
         }
     }
+}
+
+fn get_one_header<'header>(headers: &'header HeaderMap, header: &str) -> Option<&'header str> {
+    let mut header_iter = headers.get_all(header).iter();
+    let v = header_iter.next()?;
+    if header_iter.next().is_some() {
+        return None;
+    }
+
+    Some(v.to_str().expect("TODO: good strings only pls"))
 }

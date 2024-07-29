@@ -762,6 +762,7 @@ dependencies = [
  "axum-server",
  "chrono",
  "clap",
+ "gethostname",
  "hex",
  "hmac",
  "hofvarpnir",
@@ -771,6 +772,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

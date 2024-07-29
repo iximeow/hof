@@ -103,6 +103,7 @@ mod db {
             Suffix(String),
             Contains(String),
         }
+        #[derive(Debug)]
         pub struct Replica {
             // who has it? these two fields are optional because it is possible we know about a file
             // without being able to say where it is or who might have it. this is uncommon... it's also
@@ -627,6 +628,52 @@ mod db {
             }
         }
 
+        pub fn find_by_hash(&self, hashes: &crate::file::MaybeHashes) -> Result<Option<u64>, ()> {
+            let md5 = hashes.md5.as_ref().map(hex::encode);
+            let sha1 = hashes.sha1.as_ref().map(hex::encode);
+            let sha256 = hashes.sha256.as_ref().map(hex::encode);
+
+            let mut params = Vec::new();
+
+            let mut filtering = false;
+
+            let mut query = "select id from files where".to_string();
+
+            if let Some(md5) = md5 {
+                if filtering {
+                    query.push_str(" or");
+                }
+                filtering = true;
+
+                query.push_str(&format!(" md5=?{}", params.len() + 1));
+                params.push(md5);
+            }
+
+            if let Some(sha1) = sha1 {
+                if filtering {
+                    query.push_str(" or");
+                }
+                filtering = true;
+
+                query.push_str(&format!(" sha1=?{}", params.len() + 1));
+                params.push(sha1);
+            }
+
+            if let Some(sha256) = sha256 {
+                if filtering {
+                    query.push_str(" or");
+                }
+                filtering = true;
+
+                query.push_str(&format!(" sha256=?{}", params.len() + 1));
+                params.push(sha256);
+            }
+
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(query.as_str(), rusqlite::params_from_iter(params.into_iter()), |row| row.get(0))
+                .map_err(|e| { println!("TODO: rusqlite error: {}", e); () })
+        }
+
         pub fn add_file(&self, hashes: &crate::file::MaybeHashes) -> Result<FileAddResult, ()> {
             let md5 = hashes.md5.as_ref().map(hex::encode);
             let sha1 = hashes.sha1.as_ref().map(hex::encode);
@@ -703,7 +750,8 @@ mod db {
 
                 // CREATE TABLE IF NOT EXISTS file_tags (id INTEGER PRIMARY KEY, tag INTEGER, file_id INTEGER, source INTEGER, value TEXT);", params![]).unwrap();
                 // CREATE TABLE IF NOT EXISTS replicas (id INTEGER PRIMARY KEY, file_id INTEGER, who TEXT, replica TEXT, valid TINYINT, last_check INTEGER);", params![]).unwrap();
-            let mut stmt = conn.prepare("select who, replica, valid, last_check from replicas where file_id=?1;")
+            let replicas_start = std::time::Instant::now();
+            let mut stmt = conn.prepare_cached("select who, replica, valid, last_check from replicas where file_id=?1;")
                 .map_err(|e| format!("unable to prepare query: {:?}", e))?;
             let mut rows = stmt.query_map(params![file_id], |row| {
                 let who: Option<String> = row.get(0).unwrap();
@@ -722,7 +770,9 @@ mod db {
                     last_check_ts,
                 });
             }
+//            eprintln!("replicas done in {}ms", replicas_start.elapsed().as_micros() as f64 / 1000.0);
 
+            let tags_start = std::time::Instant::now();
             let mut stmt = conn.prepare("select tags.name, file_tags.value, tag_sources.name \
                 from file_tags \
                     join tags on tags.id=file_tags.tag \
@@ -745,6 +795,7 @@ mod db {
                     source,
                 });
             }
+//            eprintln!("tags done in {}ms", tags_start.elapsed().as_micros() as f64 / 1000.0);
 
             Ok(description)
         }
@@ -904,6 +955,28 @@ impl Hof {
             .map_err(|e| format!("cannot canonicalize {}: {:?}", path, e))?;
         let canonical = format!("{}", canonical.display());
         self.db.replica_lookup(replica, &canonical)
+    }
+
+    pub async fn open_replica(&self, replica: &crate::db::data::Replica) -> Result<tokio::fs::File, &'static str> {
+        eprintln!("testing replica {:?}", replica);
+        let hostname = gethostname::gethostname()
+            .into_string()
+            .expect("can turn hostname into string");
+
+        if replica.who != Some(hostname) {
+            return Err("not this hostname");
+        }
+
+        if let Some(path) = replica.replica.as_ref() {
+            match tokio::fs::File::open(path).await {
+                Ok(file) => { return Ok(file); },
+                Err(e) => {
+                    return Err("tokio error opening file");
+                }
+            }
+        } else {
+            return Err("this hostname, but no path?");
+        }
     }
 
     pub fn add_tag(&self, sha256: &str, source: u64, key: &str, value: &str) -> Result<(), String> {
