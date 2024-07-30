@@ -104,9 +104,17 @@ enum Command {
         // presumably using our credentials
         /// a remote hof to replicate the file into.
         ///
-        /// this should be a hostname or IP address (and port, if non-default). since uploads
-        /// require a token valid for writing to the remote, use a token from the local hof's
-        /// remote config if one is present. if not, raise an error...
+        /// this is used for two purposes:
+        /// * to find the remote address to replicae the file to,
+        /// * to identify what host holds the new replica, since we record that as a remote
+        /// replica of this file too
+        ///
+        /// this can be a hostname or IP address (and port, if non-default). if this is a name, the
+        /// local hof replica configuration is checked to see if we know a remote hostname for the
+        /// replica, rather than using the name directly for DNS.
+        ///
+        /// since uploads require a token valid for writing to the remote, use a token from the
+        /// local hof's remote config if one is present. if not, raise an error...
         dest: String,
 
         /// where we'd like to suggest the remote store the file.
@@ -471,16 +479,31 @@ fn main() {
                     headers.insert("file-sha256", HeaderValue::from_str(sha256).expect("valid value"));
                 }
 
+                if let Some(dest) = dest_path.as_ref() {
+                    headers.insert("file-path", HeaderValue::from_str(dest).expect("valid value"));
+                }
+
                 headers.insert("auth", HeaderValue::from_str("trustme").expect("valid value"));
 
-                eprintln!("headers: {:?}", headers);
+                eprintln!("[i] headers: {:?}", headers);
 
                 let req = client.post(&format!("http://{}/file/upload", dest))
                     .headers(headers)
                     .body(file);
                 let resp = req.send().await.expect("TODO: can send");
 
-                eprintln!("got resp: {}", resp.status());
+                match resp.status() {
+                    reqwest::StatusCode::OK => {
+                        eprintln!("[+] remote accepted the data");
+                        // TODO: add local replica tracking remote
+                    },
+                    reqwest::StatusCode::FOUND => {
+                        eprintln!("[i] remote already has the data");
+                    },
+                    o => {
+                        eprintln!("[!] remote said {}. full response: {:?}", o, resp);
+                    }
+                }
             });
         }
     }

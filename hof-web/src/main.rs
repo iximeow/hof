@@ -226,6 +226,7 @@ async fn handle_uploaded_file(auth: Auth, headers: HeaderMap, State(ctx): State<
 
             let mut target_path = ctx.incoming_dir.clone();
             target_path.push(desired_path);
+            eprintln!("want to save to {}", target_path.display());
 
             let mut interim_path = target_path.clone();
             let last_part = interim_path.pop();
