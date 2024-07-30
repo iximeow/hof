@@ -7,10 +7,11 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::path::PathBuf;
 
+use axum::async_trait;
 use axum::Router;
 use axum::routing::{get, post};
 use axum::response::{Html, IntoResponse};
-use axum::extract::{Path, State, RawQuery};
+use axum::extract::{FromRequestParts, Path, State, RawQuery};
 use axum::body::Body;
 use axum::body::HttpBody;
 use axum::{Error, Json};
@@ -18,6 +19,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::body::Bytes;
 use axum::http::{StatusCode, Uri};
 use http::header::HeaderMap;
+use http::request::Parts;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
@@ -30,6 +32,50 @@ struct WebserverConfig {
     debug_addr: Option<serde_json::Value>,
     db_path: PathBuf,
     incoming_dir: PathBuf,
+}
+
+struct Auth {
+    can_read: bool,
+    can_write: bool,
+    visibility: bool,
+}
+
+impl Auth {
+    fn all() -> Self {
+        Auth {
+            can_read: true,
+            can_write: true,
+            visibility: true,
+        }
+    }
+
+    fn default() -> Self {
+        Auth {
+            can_read: true,
+            can_write: false,
+            visibility: false,
+        }
+    }
+}
+
+#[async_trait]
+impl FromRequestParts<WebserverState> for Auth {
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, state: &WebserverState) -> Result<Self, Self::Rejection> {
+        match get_one_header(&parts.headers, "auth") {
+            Some(value) => {
+                if value == "trustme" {
+                    Ok(Auth::all())
+                } else {
+                    Err((StatusCode::BAD_REQUEST, "bad auth"))
+                }
+            }
+            None => {
+                Ok(Auth::default())
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -83,7 +129,11 @@ struct FilePaths {
     interim: PathBuf,
 }
 
-async fn handle_uploaded_file(headers: HeaderMap, State(ctx): State<WebserverState>, body: axum::body::Body) -> impl IntoResponse {
+async fn handle_uploaded_file(auth: Auth, headers: HeaderMap, State(ctx): State<WebserverState>, body: axum::body::Body) -> impl IntoResponse {
+    if !auth.can_write {
+        return (StatusCode::FORBIDDEN, Html("no")).into_response();
+    }
+
     let maybe_md5 = match get_one_header(&headers, "file-md5")
         .map(|h| hex::decode(h).map(|v| TryInto::<[u8; 16]>::try_into(v))) {
         Some(Ok(Ok(bytes))) => Some(bytes),
@@ -272,6 +322,7 @@ async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Opti
             None => {
                 if !input_stream.is_end_stream() {
                     eprintln!("TODO: think this is impossible: input stream next() yielded None, but stream is not done");
+                    break;
                 }
             }
         }
@@ -314,6 +365,38 @@ async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Opti
     // atomically move the interim file in place
 
     Ok(dest_path)
+}
+
+async fn handle_tag_file(Path(path): Path<String>, headers: HeaderMap, State(ctx): State<WebserverState>) -> impl IntoResponse {
+    let file_id = if let Ok(id) = path.parse() {
+        id
+    } else {
+        return (StatusCode::BAD_REQUEST, Html("Invalid ID".to_string())).into_response();
+    };
+
+    let desc = if let Ok(description) = ctx.dbctx.db.describe_file(file_id) {
+        description
+    } else {
+        return (StatusCode::NOT_FOUND, Html("Not Found".to_string())).into_response();
+    };
+
+    let tag = match get_one_header(&headers, "tag") {
+        Some(tag) => tag,
+        _ => {
+            return (StatusCode::BAD_REQUEST, Html("you have to provide a tag")).into_response();
+        }
+    };
+
+    let value = match get_one_header(&headers, "tag-value") {
+        Some(value) => value,
+        _ => {
+            return (StatusCode::BAD_REQUEST, Html("you have to provide a tag value (???)")).into_response();
+        }
+    };
+
+    ctx.dbctx.add_file_tag(file_id, 2, tag, value).expect("TODO: works");
+
+    StatusCode::OK.into_response()
 }
 
 async fn handle_download_file(Path(path): Path<String>, State(ctx): State<WebserverState>) -> impl IntoResponse {
@@ -600,6 +683,7 @@ async fn make_app_server(db_path: &PathBuf, incoming_dir: PathBuf) -> Router {
         .route("/help", get(handle_help))
         .route("/file/:id", get(handle_describe_file))
         .route("/file/:id/download", get(handle_download_file))
+        .route("/file/:id/tag", post(handle_tag_file))
         .route("/file/upload", post(handle_uploaded_file))
         .route("/tags/search", get(handle_search_tags))
         .fallback(fallback_get)

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// a "file". some thingy somewhere. importantly, it might be an archive, tag in some other
 /// content-tracking system (git, etc), and it may be referenced as the source of other content.
@@ -95,6 +95,18 @@ mod db {
     use rusqlite::{params, Connection, OptionalExtension};
     use std::path::Path;
     use std::sync::Mutex;
+
+    pub mod audit {
+        use serde_derive::{Deserialize, Serialize};
+
+        #[derive(Deserialize, Serialize)]
+        pub enum AuditEvent {
+            KeyAdded { key: u64 },
+            KeyDisabled { key: u64 },
+            TokenCreated { key: u64, token: u64 },
+            TokenRetired { token: u64 },
+        }
+    }
 
     pub mod data {
         pub enum PathLookup {
@@ -219,7 +231,109 @@ mod db {
                 CREATE TABLE IF NOT EXISTS tag_sources (id INTEGER PRIMARY KEY, name TEXT, version INTEGER);", params![]).unwrap();
             conn.execute("\
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_tag_sources ON tag_sources (name, version);", params![]).unwrap();
+
+            // and i guess it's time to include a bunch of auth stuff...
+            conn.execute("\
+                CREATE TABLE IF NOT EXISTS pubkeys (id INTEGER PRIMARY KEY, key BLOB, name TEXT, email TEXT, allowed BOOL);", params![]).unwrap();
+            conn.execute("\
+                CREATE UNIQUE INDEX IF NOT EXISTS key_uniqueness on pubkeys (key);", params![]).unwrap();
+            // no real acl logic yet, just a bool for if the token is allowed to see `adhoc:access=private` files
+            conn.execute("\
+                CREATE TABLE IF NOT EXISTS tokens (id INTEGER PRIMARY KEY, token TEXT, pubkey INTEGER, not_after INTEGER, issued_at INTEGER, private_ok BOOL, revoked BOOL, administrative BOOL);", params![]).unwrap();
+            conn.execute("\
+                CREATE UNIQUE INDEX IF NOT EXISTS token_uniqueness on tokens (token);", params![]).unwrap();
+            conn.execute("\
+                CREATE UNIQUE INDEX IF NOT EXISTS token_key_lookup on tokens (token, pubkey);", params![]).unwrap();
+            conn.execute("\
+                CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, time INTEGER, token_id INTEGER, action INTEGER, desc TEXT);", params![]).unwrap();
+
             Ok(())
+        }
+
+        pub fn audit_event(&self, token_id: Option<u64>, action: audit::AuditEvent) -> Result<(), String> {
+            let now = crate::now_ms();
+            let (action, desc) = match action {
+                audit::AuditEvent::KeyAdded { .. } => {
+                    (1, serde_json::to_string(&action))
+                },
+                audit::AuditEvent::KeyDisabled { .. } => {
+                    (2, serde_json::to_string(&action))
+                },
+                audit::AuditEvent::TokenCreated { .. } => {
+                    (3, serde_json::to_string(&action))
+                },
+                audit::AuditEvent::TokenRetired { .. } => {
+                    (4, serde_json::to_string(&action))
+                }
+            };
+
+            Ok(())
+        }
+
+        pub fn create_token(&self, pubkey: u64, private_ok: bool) -> Result<String, String> {
+            let conn = self.conn.lock().unwrap();
+            let token = "new token".to_string();
+            // TODO: should check that pubkey references something in the pubkeys table... honestly
+            // should have a foreign key constraint too
+            let now = crate::now_ms();
+            let issued_at = now;
+            // rough idea: expire a token if it has not been used in a month.
+            let not_after = now + 1000 * 3600 * 24 * 30;
+
+            let insert_res = conn.execute(
+                "insert into tokens (token, pubkey, not_after, issued_at, private_ok, revoked, administrative) values (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+                // not for private access, not revoked, and definitely not administrative by
+                // default.
+                params![token, pubkey, not_after, issued_at, false, false, false],
+            );
+
+            match insert_res {
+                Ok(1) => {
+                    // inserted onw item, so that's the new id.
+                    let last_id = conn.last_insert_rowid() as u64;
+                    drop(conn);
+                    self.audit_event(None, audit::AuditEvent::TokenCreated { key: last_id, token: last_id, })
+                        .expect("can record");
+                    Ok(token.to_owned())
+                }
+                Ok(rows) => {
+                    unreachable!("attempted to insert one row, actually inserted .... {} ???", rows);
+                }
+                Err(rusqlite::Error::SqliteFailure(sql_err, _)) if sql_err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                    Err("already exists".to_string())
+                }
+                Err(e) => {
+                    panic!("unexpected err: {:?}", e);
+                }
+            }
+        }
+
+        pub fn add_key(&self, key: &[u8], name: &str, email: &str) -> Result<u64, String> {
+            let conn = self.conn.lock().unwrap();
+            let insert_res = conn.execute(
+                "insert into pubkeys (key, name, email, allowed, administrative) values (?1, ?2, ?3, ?4, ?5);",
+                params![key, name, email, true, false]
+            );
+
+            match insert_res {
+                Ok(1) => {
+                    // inserted onw item, so that's the new id.
+                    let last_id = conn.last_insert_rowid() as u64;
+                    drop(conn);
+                    self.audit_event(None, audit::AuditEvent::KeyAdded { key: last_id })
+                        .expect("can record");
+                    Ok(last_id)
+                }
+                Ok(rows) => {
+                    unreachable!("attempted to insert one row, actually inserted .... {} ???", rows);
+                }
+                Err(rusqlite::Error::SqliteFailure(sql_err, _)) if sql_err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                    Err("already exists".to_string())
+                }
+                Err(e) => {
+                    panic!("unexpected err: {:?}", e);
+                }
+            }
         }
 
         pub fn get_tag_generator_id(&self, name: &str, version: u64) -> Result<Option<u64>, String> {
@@ -882,17 +996,27 @@ pub mod file {
 
 pub struct Hof {
     pub db: db::DbCtx,
+//    pub cfg: Config,
+}
+
+struct Config {
+    pub config_root: PathBuf,
+//    pub identity: Ed25519KeyPair,
 }
 
 use db::FileAddResult;
 
 impl Hof {
-    pub fn new<P: AsRef<Path>>(db_path: P) -> Self {
+    pub fn new<P: AsRef<Path>>(db_path: P) -> Self { //, config_path: P) -> Self {
         let mut db = db::DbCtx::new(db_path);
+        // let mut cfg = Config::new(config_path);
         // TODO: don't just always initialize...
         db.create_tables().expect("can create tables");
+        // TODO: don't just always run initial setup...?
+        // cfg.initialize();
         Self {
             db,
+            // cfg,
         }
     }
 

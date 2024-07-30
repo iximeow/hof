@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use std::collections::HashSet;
 use std::fmt;
@@ -9,7 +9,7 @@ use hofvarpnir::Hof;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
-struct Args {
+struct Cli {
     /// path to a hof database (defaults to "./hof.db")
     db_path: Option<String>,
 
@@ -89,6 +89,58 @@ enum Command {
 
         what: String,
     },
+
+    #[command(subcommand)]
+    Config(Config),
+
+    Replicate {
+        #[clap(long)]
+        category: Option<ItemCategory>,
+
+        what: String,
+
+        // TODO: should this be able to take a "src" to replicate from? in which case the behavior
+        // is more like we're asking remote A to act on our behalf to replicate to remote B,
+        // presumably using our credentials
+        /// a remote hof to replicate the file into.
+        ///
+        /// this should be a hostname or IP address (and port, if non-default). since uploads
+        /// require a token valid for writing to the remote, use a token from the local hof's
+        /// remote config if one is present. if not, raise an error...
+        dest: String,
+
+        /// where we'd like to suggest the remote store the file.
+        dest_path: Option<String>,
+    }
+}
+
+#[derive(Clone, Subcommand)]
+enum Config {
+    AddRemote {
+        name: String,
+        addr: String,
+    },
+    ListRemotes,
+    RemoveRemote {
+        name: String,
+    },
+    Identity,
+    Remote {
+        name: String,
+        #[command(subcommand)]
+        operation: RemoteConf
+    },
+}
+
+#[derive(Clone, Subcommand)]
+enum RemoteConf {
+    AddRemote {
+        pubkey: String,
+    },
+    AlterToken {
+        token: String,
+        private_ok: bool,
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, clap::ValueEnum)]
@@ -111,11 +163,12 @@ impl fmt::Display for ItemCategory {
 }
 
 fn main() {
-    let args = Args::parse();
+    let args = Cli::parse();
 
     let db_path = args.db_path.unwrap_or_else(|| "./hof.db".to_owned());
+    let config_path = "./config".to_owned();
 
-    let hof = Hof::new(db_path);
+    let hof = Hof::new(db_path); //, config_path);
 
     match args.command {
         Command::Describe { category, what } => {
@@ -165,6 +218,18 @@ fn main() {
             let desc = hof.db.describe_file(id).expect("can describe file");
 
             print_description(&desc);
+        },
+        Command::Config(Config::AddRemote { name, addr }) => {
+        },
+        Command::Config(Config::ListRemotes) => {
+        },
+        Command::Config(Config::RemoveRemote { name }) => {
+        },
+        Command::Config(Config::Identity) => {
+        },
+        Command::Config(Config::Remote { name, operation: RemoteConf::AddRemote { pubkey }}) => {
+        },
+        Command::Config(Config::Remote { name, operation: RemoteConf::AlterToken { token, private_ok }}) => {
         },
         Command::AddFile { what, recursive } => {
             match recursive {
@@ -254,35 +319,7 @@ fn main() {
             let file_ids = hof.db.select_by_tags(&computed_tags).expect("can query tags");
             for f in file_ids.iter() {
                 let desc = hof.db.describe_file(*f).expect("can describe file");
-
-                println!("file {}", desc.file_id);
-                println!("  sha256: {}", desc.sha256.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
-                println!("  sha1:   {}", desc.sha1.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
-                println!("  md5:    {}", desc.md5.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
-                println!("replicas:");
-                for replica in desc.replicas.iter() {
-                    if let Some(replica_name) = replica.replica.as_ref() {
-                        if let Some(who) = replica.who.as_ref() {
-                            print!("  {}: {}, checked {}", who, replica_name, replica.last_check_ts);
-                            if replica.valid {
-                                print!(" (valid)");
-                            }
-                        } else {
-                            print!("  <unknown>: {}", replica_name);
-                        }
-                    } else if let Some(replica_who) = replica.who.as_ref() {
-                        print!("  {}: remote", replica_who);
-                    } else {
-                        print!("  <unknown>");
-                    }
-                    println!("");
-                }
-                println!("tags:");
-                for tag in desc.tags.iter() {
-                    println!("  {}: {}, from {}", tag.name, tag.value, tag.source);
-                }
-
-//                println!("file {}", f);
+                print_description(&desc);
             }
         },
         Command::IndexTree { root } => {
@@ -321,6 +358,131 @@ fn main() {
 //            hof.db.select_from_replica_
             panic!("search path");
         },
+        Command::Replicate {
+            category,
+            what,
+            dest,
+            dest_path,
+        } => {
+            use reqwest::header::HeaderValue;
+            let id = match category {
+                Some(ItemCategory::Path) => {
+                    let hostname: String = gethostname::gethostname()
+                        .into_string()
+                        .expect("hostname is a valid utf8 string");
+
+                    hof.replica_lookup(&hostname, &what).expect("TODO: can do db query")
+                },
+                Some(ItemCategory::Hash) => {
+                    hof.hash_lookup(&what).expect("TODO: can do db query")
+                },
+                Some(ItemCategory::Id) => {
+                    let id: u64 = what.parse().expect("TODO: handle non-int \"id\"");
+                    Some(id)
+                },
+                None => {
+                    // we don't know if the provided thing is a hash, file path, or id. the user
+                    // hasn't suggested one way or the other. try a hash lookup, assume it might be
+                    // a file path if not.
+                    if let Some(id) = hof.hash_lookup(&what).expect("TODO: can do db query") {
+                        Some(id)
+                    } else {
+                        let hostname: String = gethostname::gethostname()
+                            .into_string()
+                            .expect("hostname is a valid utf8 string");
+
+                        hof.replica_lookup(&hostname, &what).expect("TODO: can do db query")
+                    }
+                }
+            };
+
+            let id = match id {
+                Some(id) => id,
+                None => {
+                    if let Some(category) = category {
+                        eprintln!("no {} tracked as {}", category, what);
+                    } else {
+                        eprintln!("{} is not a known path or hash", what);
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            let desc = hof.db.describe_file(id).expect("can describe file");
+
+            let hostname: String = gethostname::gethostname()
+                .into_string()
+                .expect("hostname is a valid utf8 string");
+
+            let path: PathBuf = {
+                let mut path = None;
+                for replica in desc.replicas.iter() {
+                    if replica.valid && replica.who.as_ref() == Some(&hostname) {
+                        if let Some(replica_path) = replica.replica.as_ref() {
+                            match std::fs::metadata(&replica_path) {
+                                Ok(md) => {
+                                    if md.is_file() {
+                                        path = Some(replica_path.to_owned());
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("could not get metadata for {}: {}", replica_path, e);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                match path {
+                    Some(p) => p.into(),
+                    None => {
+                        panic!("no local replica for {:?} {}", category, what);
+                    }
+                }
+            };
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build().expect("TODO: current thread runtime");
+
+            let resp = rt.block_on(async move {
+                let file = match tokio::fs::File::open(&path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("couldn't open file {} but we know it? {:?}", path.display(), e);
+                        std::process::exit(1);
+                    }
+                };
+
+                // ok, file exists, lets.. put it over there now.
+                let client = reqwest::Client::new();
+                let mut headers = reqwest::header::HeaderMap::new();
+
+                if let Some(md5) = desc.md5.as_ref() {
+                    headers.insert("file-md5", HeaderValue::from_str(md5).expect("valid value"));
+                }
+
+                if let Some(sha1) = desc.sha1.as_ref() {
+                    headers.insert("file-sha1", HeaderValue::from_str(sha1).expect("valid value"));
+                }
+
+                if let Some(sha256) = desc.sha256.as_ref() {
+                    headers.insert("file-sha256", HeaderValue::from_str(sha256).expect("valid value"));
+                }
+
+                headers.insert("auth", HeaderValue::from_str("trustme").expect("valid value"));
+
+                eprintln!("headers: {:?}", headers);
+
+                let req = client.post(&format!("http://{}/file/upload", dest))
+                    .headers(headers)
+                    .body(file);
+                let resp = req.send().await.expect("TODO: can send");
+
+                eprintln!("got resp: {}", resp.status());
+            });
+        }
     }
 }
 
