@@ -260,36 +260,37 @@ async fn handle_uploaded_file(auth: Auth, headers: HeaderMap, State(ctx): State<
 
     match save_file(body, &file_paths, maybe_hashes).await {
         Ok(final_path) => {
-            let mut standin_final_file = match tokio::fs::File::options().read(true).write(true).create_new(true).open(&final_path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("conflict on final file, apparently we already have this? {:?}", e);
-                    return StatusCode::CONFLICT.into_response();
-                }
-            };
-            std::fs::rename(&file_paths.interim, &final_path)
-                .expect("TODO: handle rename failing after everything else succeeded");
             // ok! we've saved the file. now we can insert it into the db...
             ctx.dbctx.add_file(final_path)
                 .expect("can add file");
 //            eprintln!("pretend i just added {} to the db", final_path.display());
             StatusCode::OK.into_response()
         },
+        Err(SaveError::Conflict) => {
+            StatusCode::CONFLICT.into_response()
+        }
         Err(e) => {
-            eprintln!("failed to receive file: {}", e);
+            eprintln!("failed to receive file: {:?}", e);
             // TODO: distinguish if it's on us or the client...
             StatusCode::BAD_REQUEST.into_response()
         }
     }
 }
 
-async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Option<MaybeHashes>) -> Result<PathBuf, String> {
+#[derive(Debug)]
+enum SaveError {
+    Conflict,
+    Other(String),
+}
+
+async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Option<MaybeHashes>) -> Result<PathBuf, SaveError> {
     eprintln!("[.] interim file path: {:?}", paths.interim.display());
     let mut interim_file = match tokio::fs::File::options().read(true).write(true).create_new(true).open(&paths.interim).await {
         Ok(f) => f,
         Err(e) => {
             // TODO: was the error because the file exists, or something else?
-            return Err(format!("open: {:?}", e));
+            eprintln!("[!] error opening {}: {:?}", paths.interim.display(), e);
+            return Err(SaveError::Conflict);
         }
     };
     // return StatusCode::CONFLICT.into_response();
@@ -308,7 +309,7 @@ async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Opti
                     }
                     Err(e) => {
                         eprintln!("error writing to file: {:?}", e);
-                        return Err(format!("write: {:?}", e));
+                        return Err(SaveError::Other(format!("write: {:?}", e)));
                     }
                 }
 
@@ -319,7 +320,7 @@ async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Opti
             }
             Some(Err(e)) => {
                 eprintln!("error reading from file: {:?}", e);
-                return Err(format!("read: {:?}", e));
+                return Err(SaveError::Other(format!("read: {:?}", e)));
             }
             None => {
                 if !input_stream.is_end_stream() {
@@ -338,17 +339,17 @@ async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Opti
     if let Some(maybe_hashes) = maybe_hashes {
         if let Some(sha256) = maybe_hashes.sha256.as_ref() {
             if sha256 != &hashes.sha256 {
-                return Err(format!("sha256s dont match"));
+                return Err(SaveError::Other(format!("sha256s dont match")));
             }
         }
         if let Some(sha1) = maybe_hashes.sha1.as_ref() {
             if sha1 != &hashes.sha1 {
-                return Err(format!("sha1s dont match"));
+                return Err(SaveError::Other(format!("sha1s dont match")));
             }
         }
         if let Some(md5) = maybe_hashes.md5.as_ref() {
             if md5 != &hashes.md5 {
-                return Err(format!("md5s dont match"));
+                return Err(SaveError::Other(format!("md5s dont match")));
             }
         }
     }
@@ -366,16 +367,28 @@ async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Opti
 
     eprintln!("dest file: {:?}", dest_path.display());
 
+    // atomically move the interim file in place
+
+    let mut standin_final_file = match tokio::fs::File::options().read(true).write(true).create_new(true).open(&dest_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("conflict on final file, apparently we already have this? {:?}", e);
+            // conflict on the final file, but we don't already have it and we didn't conflict on
+            // an interim file? this might have been a race with another upload of the same
+            // file...???
+            return Err(SaveError::Conflict);
+        }
+    };
+
     match std::fs::rename(&paths.interim, &dest_path) {
         Ok(()) => {
             // all done! yay!
         }
         Err(e) => {
-            return Err(format!("could not move interim file into place...? {:?}", e));
+            eprintln!("could not move interim file into place...? {:?}", e);
+            return Err(SaveError::Conflict);
         }
     }
-
-    // atomically move the interim file in place
 
     Ok(dest_path)
 }
