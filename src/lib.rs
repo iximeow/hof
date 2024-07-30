@@ -841,7 +841,7 @@ mod db {
 
             let mut selected_tags: Vec<u64> = Vec::new();
 
-            let (sha256, sha1, md5): (Option<String>, Option<String>, Option<String>) = conn.query_row(
+            let (sha256, sha1, md5): (Option<String>, Option<String>, Option<String>) = match conn.query_row(
                 "select sha256, sha1, md5 from files where id=?1;",
                 params![file_id],
                 |row| {
@@ -851,7 +851,15 @@ mod db {
                         row.get(2).unwrap(),
                     ))
                 }
-            ).expect("TODO: can query");
+            ) {
+                Ok(result) => result,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err("no data".to_string());
+                }
+                Err(e) => {
+                    panic!("unexpected query error: {:?}", e);
+                }
+            };
 
             let mut description = data::Description {
                 file_id,
