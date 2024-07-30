@@ -284,6 +284,7 @@ async fn handle_uploaded_file(auth: Auth, headers: HeaderMap, State(ctx): State<
 }
 
 async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Option<MaybeHashes>) -> Result<PathBuf, String> {
+    eprintln!("[.] interim file path: {:?}", paths.interim.display());
     let mut interim_file = match tokio::fs::File::options().read(true).write(true).create_new(true).open(&paths.interim).await {
         Ok(f) => f,
         Err(e) => {
@@ -362,6 +363,17 @@ async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Opti
             hex::encode(hashes.sha256).into()
         }
     };
+
+    eprintln!("dest file: {:?}", dest_path.display());
+
+    match std::fs::rename(&paths.interim, &dest_path) {
+        Ok(()) => {
+            // all done! yay!
+        }
+        Err(e) => {
+            return Err(format!("could not move interim file into place...? {:?}", e));
+        }
+    }
 
     // atomically move the interim file in place
 
