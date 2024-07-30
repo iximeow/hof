@@ -126,6 +126,7 @@ async fn handle_help(State(ctx): State<WebserverState>) -> impl IntoResponse {
 
 struct FilePaths {
     target: Option<PathBuf>,
+    target_base: PathBuf,
     interim: PathBuf,
 }
 
@@ -234,6 +235,7 @@ async fn handle_uploaded_file(auth: Auth, headers: HeaderMap, State(ctx): State<
 
             FilePaths {
                 target: Some(target_path),
+                target_base: ctx.incoming_dir.clone(),
                 interim: interim_path,
             }
         }
@@ -253,6 +255,7 @@ async fn handle_uploaded_file(auth: Auth, headers: HeaderMap, State(ctx): State<
             let interim_path = "test.hofpart".into();
             FilePaths {
                 target: None,
+                target_base: ctx.incoming_dir.clone(),
                 interim: interim_path,
             }
         }
@@ -261,10 +264,10 @@ async fn handle_uploaded_file(auth: Auth, headers: HeaderMap, State(ctx): State<
     match save_file(body, &file_paths, maybe_hashes).await {
         Ok(final_path) => {
             // ok! we've saved the file. now we can insert it into the db...
-            ctx.dbctx.add_file(final_path)
+            let id = ctx.dbctx.add_file(final_path)
                 .expect("can add file");
 //            eprintln!("pretend i just added {} to the db", final_path.display());
-            StatusCode::OK.into_response()
+            (StatusCode::OK, Html(id.to_string())).into_response()
         },
         Err(SaveError::Conflict) => {
             StatusCode::CONFLICT.into_response()
@@ -361,7 +364,7 @@ async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Opti
         None => {
             // TODO: at last split this by the first byte, or two bytes, so they all don't go in
             // the same directory...
-            hex::encode(hashes.sha256).into()
+            paths.target_base.join(hex::encode(hashes.sha256))
         }
     };
 

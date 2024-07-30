@@ -464,8 +464,10 @@ fn main() {
                 };
 
                 // ok, file exists, lets.. put it over there now.
+                use reqwest::{Client, header::HeaderMap};
+
                 let client = reqwest::Client::new();
-                let mut headers = reqwest::header::HeaderMap::new();
+                let mut headers = HeaderMap::new();
 
                 if let Some(md5) = desc.md5.as_ref() {
                     headers.insert("file-md5", HeaderValue::from_str(md5).expect("valid value"));
@@ -495,6 +497,25 @@ fn main() {
                 match resp.status() {
                     reqwest::StatusCode::OK => {
                         eprintln!("[+] remote accepted the data");
+                        let body = resp.text().await.expect("can get body");
+                        let remote_file_id: u64 = body.parse()
+                            .expect("valid integer");
+                        for tag in desc.tags.iter() {
+                            let mut tag_headers = HeaderMap::new();
+                            tag_headers.insert("tag", HeaderValue::from_str(&tag.name).expect("can header"));
+                            tag_headers.insert("tag-value", HeaderValue::from_str(&tag.value).expect("can header"));
+                            let tag_res = client.post(
+                                &format!(
+                                    "http://{}/file/{}/tag",
+                                    dest,
+                                    remote_file_id,
+                                )
+                            )
+                                .headers(tag_headers)
+                                .send()
+                                .await
+                                .expect("can send tag req");
+                        }
                         // TODO: add local replica tracking remote
                     },
                     reqwest::StatusCode::FOUND => {

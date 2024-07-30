@@ -1028,7 +1028,7 @@ impl Hof {
         }
     }
 
-    pub fn add_file<P: AsRef<Path>>(&self, path: P) -> Result<(), String> {
+    pub fn add_file<P: AsRef<Path>>(&self, path: P) -> Result<u64, String> {
         let path: &Path = path.as_ref();
         let mut file = File::open(path).map_err(|e| format!("{}", e))?;
 
@@ -1051,7 +1051,7 @@ impl Hof {
             .into_string()
             .expect("hostname is a valid utf8 string ????? look i know this isn't guaranteed but come on");
         self.db.add_replica(file_id, Some(hostname.as_str()), Some(&format!("{}", canonical.display()))).expect("can add replica");
-        Ok(())
+        Ok(file_id)
     }
 
     pub fn add_remote_file(&self, hashes: crate::file::MaybeHashes, remote: Option<String>, path: Option<String>) -> Result<(), String> {
