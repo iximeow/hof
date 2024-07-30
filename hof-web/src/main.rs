@@ -230,7 +230,7 @@ async fn handle_uploaded_file(auth: Auth, headers: HeaderMap, State(ctx): State<
 
             let mut interim_path = target_path.clone();
             let last_part = interim_path.pop();
-            interim_path.join(&format!("{}.hofpart", last_part));
+            let interim_path = interim_path.join(&format!("{}.hofpart", last_part));
 
             FilePaths {
                 target: Some(target_path),
