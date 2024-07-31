@@ -1004,27 +1004,132 @@ pub mod file {
 
 pub struct Hof {
     pub db: db::DbCtx,
-//    pub cfg: Config,
+    pub cfg: Config,
 }
 
-struct Config {
+pub struct Config {
     pub config_root: PathBuf,
-//    pub identity: Ed25519KeyPair,
+    pub identity: ring::signature::Ed25519KeyPair,
+}
+
+impl Config {
+    fn new<P: AsRef<Path>>(config_path: P) -> Result<Self, String> {
+        let config_path = config_path.as_ref();
+        if let Ok(md) = std::fs::metadata(&config_path) {
+            if md.is_dir() {
+                // config directory exists. might have contents?
+            } else {
+                return Err(format!("config path is not a directory: {}", config_path.display()));
+            }
+        } else {
+            // config directory doesn't exist.
+            eprintln!("[+] initial setup: creating config dir at {}", config_path.display());
+            match std::fs::create_dir_all(config_path) {
+                Ok(()) => {},
+                Err(e) => {
+                    return Err(format!("config dir could not be created: {:?}", e));
+                }
+            }
+            match std::fs::create_dir_all(config_path.join("peers")) {
+                Ok(()) => {},
+                Err(e) => {
+                    return Err(format!("peers dir could not be created: {:?}", e));
+                }
+            }
+        }
+
+        let identity_file = config_path.join("identity.pem");
+        let identity_pubkey = config_path.join("identity.pub");
+        let keypair: ring::signature::Ed25519KeyPair = match std::fs::metadata(&identity_file) {
+            Ok(md) => {
+                if md.is_file() {
+                    // great, identity file exists and is a file
+                    let pkcs8_pem = String::from_utf8(std::fs::read(&identity_file)
+                        .expect("read is quick")).expect("ok");
+
+                    let (label, decoded) = pkcs8::Document::from_pem(&pkcs8_pem)
+                        .expect("works");
+
+                    let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(decoded.as_bytes())
+                        .expect("keypair to be valid");
+
+                    keypair
+                } else {
+                    return Err(format!("identity file ({}) is not a file", identity_file.display()));
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // identity file doesn't exist, lets make it.
+                eprintln!("[+] initial startup: creating identity file");
+                let mut rng = ring::rand::SystemRandom::new();
+                let document = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+                    .expect("can generate identity file");
+                let doc_bytes: &[u8] = document.as_ref();
+                let pem = pkcs8::Document::try_from(doc_bytes)
+                    .expect("works")
+                    .to_pem("HOF IDENTITY", pkcs8::LineEnding::LF)
+                    .expect("also works");
+                let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(doc_bytes)
+                    .expect("new keypair is valid");
+                use ring::signature::KeyPair;
+                let public_key: &[u8] = keypair.public_key().as_ref();
+                use base64::prelude::*;
+                let pub_doc = BASE64_STANDARD.encode(public_key);
+                std::fs::write(identity_file, pem.as_bytes());
+                std::fs::write(identity_pubkey, pub_doc.as_bytes());
+                eprintln!("[+] identity generated");
+                keypair
+            }
+            Err(e) => {
+                return Err(format!("unable to open identity file: {:?}", e));
+            }
+        };
+
+        Ok(Config {
+            config_root: config_path.to_path_buf(),
+            identity: keypair,
+        })
+    }
+
+    pub fn pubkey_base64(&self) -> String {
+        use ring::signature::KeyPair;
+        let public_key: &[u8] = self.identity.public_key().as_ref();
+        use base64::prelude::*;
+        BASE64_STANDARD.encode(public_key)
+    }
+
+    pub fn add_remote(&self, name: &str, address: &str, pubkey: &str) -> Result<(), String> {
+        if name.contains(',') {
+            return Err("TODO: dont want to deal with you rn".to_string());
+        }
+
+        let obj = serde_json::json!({
+            "name": name,
+            "address": address,
+            "pubkey": pubkey,
+        });
+
+        let peer_filename = format!("{},{}.json", name, address);
+
+        std::fs::write(self.config_root.join("peers").join(peer_filename), serde_json::to_string(&obj).expect("works").as_bytes())
+            .expect("TODO: can write peer config");
+
+        Ok(())
+    }
 }
 
 use db::FileAddResult;
 
 impl Hof {
-    pub fn new<P: AsRef<Path>>(db_path: P) -> Self { //, config_path: P) -> Self {
+    pub fn new<P: AsRef<Path>>(db_path: P, config_path: P) -> Self {
         let mut db = db::DbCtx::new(db_path);
-        // let mut cfg = Config::new(config_path);
+        let mut cfg = Config::new(config_path)
+            .expect("can get initial configs together");
         // TODO: don't just always initialize...
         db.create_tables().expect("can create tables");
-        // TODO: don't just always run initial setup...?
-        // cfg.initialize();
         Self {
             db,
-            // cfg,
+            cfg,
         }
     }
 

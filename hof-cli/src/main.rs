@@ -124,17 +124,8 @@ enum Command {
 
 #[derive(Clone, Subcommand)]
 enum Config {
-    AddRemote {
-        name: String,
-        addr: String,
-    },
-    ListRemotes,
-    RemoveRemote {
-        name: String,
-    },
     Identity,
     Remote {
-        name: String,
         #[command(subcommand)]
         operation: RemoteConf
     },
@@ -142,8 +133,16 @@ enum Config {
 
 #[derive(Clone, Subcommand)]
 enum RemoteConf {
-    AddRemote {
+    Add {
+        name: String,
+        addr: String,
         pubkey: String,
+    },
+    List {
+        name: Option<String>,
+    },
+    Remove {
+        name: String,
     },
     AlterToken {
         token: String,
@@ -176,7 +175,7 @@ fn main() {
     let db_path = args.db_path.unwrap_or_else(|| "./hof.db".to_owned());
     let config_path = "./config".to_owned();
 
-    let hof = Hof::new(db_path); //, config_path);
+    let hof = Hof::new(db_path, config_path);
 
     match args.command {
         Command::Describe { category, what } => {
@@ -227,17 +226,24 @@ fn main() {
 
             print_description(&desc);
         },
-        Command::Config(Config::AddRemote { name, addr }) => {
-        },
-        Command::Config(Config::ListRemotes) => {
-        },
-        Command::Config(Config::RemoveRemote { name }) => {
-        },
         Command::Config(Config::Identity) => {
+            println!("my identity: {}", hof.cfg.pubkey_base64());
         },
-        Command::Config(Config::Remote { name, operation: RemoteConf::AddRemote { pubkey }}) => {
+        Command::Config(Config::Remote { operation: RemoteConf::Add { name, addr, pubkey }}) => {
+            match hof.cfg.add_remote(&name, &addr, &pubkey) {
+                Ok(()) => {
+                    println!("[+] added remote {}", name);
+                }
+                Err(e) => {
+                    println!("[!] could not add remote {}: {}", name, e);
+                }
+            }
         },
-        Command::Config(Config::Remote { name, operation: RemoteConf::AlterToken { token, private_ok }}) => {
+        Command::Config(Config::Remote { operation: RemoteConf::List { name }}) => {
+        },
+        Command::Config(Config::Remote { operation: RemoteConf::Remove { name }}) => {
+        },
+        Command::Config(Config::Remote { operation: RemoteConf::AlterToken { token, private_ok }}) => {
         },
         Command::AddFile { what, recursive } => {
             match recursive {

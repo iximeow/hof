@@ -37,7 +37,7 @@ hyper = "*"
 futures-util = "*"
 axum-macros = "*"
 lettre = "*"
-base64 = "*"
+base64 = "0.22.1"
 tracing = "*"
 tracing-subscriber = "*"
 http-body = "*"
@@ -56,3 +56,5 @@ chrono = "*"
 gethostname = "0.4.3"
 hof-tags = { path = "./hof-tags" }
 hof-ffi = { path = "./hof-ffi" }
+ring = "*"
+pkcs8 = { version = "*", features = ["alloc", "std", "pem"] }
