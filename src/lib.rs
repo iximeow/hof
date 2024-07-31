@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use serde_derive::{Deserialize, Serialize};
+
 /// a "file". some thingy somewhere. importantly, it might be an archive, tag in some other
 /// content-tracking system (git, etc), and it may be referenced as the source of other content.
 /// a file may have associated data and replicas as tracked in a hof database.
@@ -1012,7 +1014,37 @@ pub struct Config {
     pub identity: ring::signature::Ed25519KeyPair,
 }
 
+#[derive(Deserialize, Serialize)]
+struct PeerConfig {
+    name: String,
+    address: String,
+    pubkey: String,
+}
+
 impl Config {
+    pub fn lookup_remote_addr(&self, name: &str) -> Result<Option<String>, String> {
+        let peer_configs = match std::fs::read_dir(self.config_root.join("peers")) {
+            Ok(iter) => iter,
+            Err(e) => { return Err(format!("TODO: ??? {:?}", e)); }
+        };
+
+        for f in peer_configs {
+            let path = f.expect("TODO: works").path();
+            if path.file_name().expect("TODO: exists").to_str().expect("TODO: works").ends_with(".json") {
+                let s = std::fs::read_to_string(path)
+                    .expect("TODO: works");
+                let peer_config: PeerConfig = serde_json::from_str(&s)
+                    .expect("TODO: works");
+
+                if peer_config.name == name {
+                    return Ok(Some(peer_config.address.clone()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     fn new<P: AsRef<Path>>(config_path: P) -> Result<Self, String> {
         let config_path = config_path.as_ref();
         if let Ok(md) = std::fs::metadata(&config_path) {
@@ -1103,11 +1135,11 @@ impl Config {
             return Err("TODO: dont want to deal with you rn".to_string());
         }
 
-        let obj = serde_json::json!({
-            "name": name,
-            "address": address,
-            "pubkey": pubkey,
-        });
+        let obj = PeerConfig {
+            name: name.to_owned(),
+            address: address.to_owned(),
+            pubkey: pubkey.to_owned(),
+        };
 
         let peer_filename = format!("{},{}.json", name, address);
 

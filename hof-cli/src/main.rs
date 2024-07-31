@@ -493,9 +493,11 @@ fn main() {
 
                 headers.insert("auth", HeaderValue::from_str("trustme").expect("valid value"));
 
+                let dest_addr = hof.cfg.lookup_remote_addr(&dest).expect("TODO: works").unwrap_or_else(|| dest.clone());
+
                 eprintln!("[i] headers: {:?}", headers);
 
-                let req = client.post(&format!("http://{}/file/upload", dest))
+                let req = client.post(&format!("http://{}/file/upload", dest_addr))
                     .headers(headers)
                     .body(file);
                 let resp = req.send().await.expect("TODO: can send");
@@ -514,7 +516,7 @@ fn main() {
                             let tag_res = client.post(
                                 &format!(
                                     "http://{}/file/{}/tag",
-                                    dest,
+                                    dest_addr,
                                     remote_file_id,
                                 )
                             )
