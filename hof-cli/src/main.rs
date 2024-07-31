@@ -501,6 +501,7 @@ fn main() {
                         let remote_file_id: u64 = body.parse()
                             .expect("valid integer");
                         for tag in desc.tags.iter() {
+                            eprintln!("sending tag {}={}", tag.name, tag.value);
                             let mut tag_headers = HeaderMap::new();
                             tag_headers.insert("tag", HeaderValue::from_str(&tag.name).expect("can header"));
                             tag_headers.insert("tag-value", HeaderValue::from_str(&tag.value).expect("can header"));
@@ -515,6 +516,8 @@ fn main() {
                                 .send()
                                 .await
                                 .expect("can send tag req");
+
+                            eprintln!("[!] tag res: {:?}", tag_res);
                         }
                         // TODO: add local replica tracking remote
                     },
