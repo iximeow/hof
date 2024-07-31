@@ -31,6 +31,7 @@ use hofvarpnir::{Hof, file::MaybeHashes};
 struct WebserverConfig {
     debug_addr: Option<serde_json::Value>,
     db_path: PathBuf,
+    config_path: PathBuf,
     incoming_dir: PathBuf,
 }
 
@@ -90,10 +91,11 @@ async fn main() {
         std::fs::File::open(config_path).expect("file exists and is accessible")
     ).expect("valid json for WebserverConfig");
     let db_path = web_config.db_path.clone();
+    let config_path = web_config.config_path.clone();
     let incoming_dir = web_config.incoming_dir.clone();
 
     if let Some(addr_conf) = web_config.debug_addr.as_ref() {
-        tokio::spawn(bind_server(addr_conf.clone(), db_path.clone(), incoming_dir.clone()));
+        tokio::spawn(bind_server(addr_conf.clone(), db_path.clone(), config_path.clone(), incoming_dir.clone()));
     }
 
     loop {
@@ -706,7 +708,7 @@ struct WebserverState {
     incoming_dir: PathBuf
 }
 
-async fn make_app_server(db_path: &PathBuf, incoming_dir: PathBuf) -> Router {
+async fn make_app_server(db_path: &PathBuf, config_path: &PathBuf, incoming_dir: PathBuf) -> Router {
     Router::new()
         .route("/", get(handle_tags_index))
         .route("/help", get(handle_help))
@@ -717,13 +719,13 @@ async fn make_app_server(db_path: &PathBuf, incoming_dir: PathBuf) -> Router {
         .route("/tags/search", get(handle_search_tags))
         .fallback(fallback_get)
         .with_state(WebserverState {
-            dbctx: Arc::new(Hof::new(db_path)),
+            dbctx: Arc::new(Hof::new(db_path, config_path)),
             incoming_dir,
         })
 }
 
-async fn bind_server(conf: serde_json::Value, db_path: PathBuf, incoming_dir: PathBuf) -> std::io::Result<()> {
-    let server = make_app_server(&db_path, incoming_dir).await.into_make_service();
+async fn bind_server(conf: serde_json::Value, db_path: PathBuf, config_path: PathBuf, incoming_dir: PathBuf) -> std::io::Result<()> {
+    let server = make_app_server(&db_path, &config_path, incoming_dir).await.into_make_service();
 
     use serde_json::Value;
     match conf {
