@@ -55,7 +55,11 @@ enum Command {
 
     ListTags,
 
-    SearchTags { tags: Vec<String> },
+    /// search for tags or tag values
+    #[command(subcommand)]
+    Tag(TagOp),
+
+    Search { tags: Vec<String> },
 
     /// find files with `part` in their name.
     SearchPath {
@@ -120,6 +124,31 @@ enum Command {
         /// where we'd like to suggest the remote store the file.
         dest_path: Option<String>,
     }
+}
+
+#[derive(Subcommand)]
+enum TagOp {
+    #[command(subcommand)]
+    Search(TagSearch),
+}
+
+#[derive(Subcommand)]
+enum TagSearch {
+    Name {
+        #[clap(long, default_value_t = false)]
+        exact: bool,
+        substr: String,
+    },
+    Value {
+        #[clap(long, default_value_t = false)]
+        exact: bool,
+        /// only return results for tags with less than this many distinct values.
+        /// this can be useful to avoid unintentionally picking tags for highly-variable tags like
+        /// "cite" or "ref". defaults to 10. set to 0 to disable this filter.
+        #[clap(long, default_value_t = 10)]
+        max_cardinality: u64,
+        substr: String,
+    },
 }
 
 #[derive(Clone, Subcommand)]
@@ -300,7 +329,23 @@ fn main() {
                 println!("{}", hof.db.tag_name(tag_id).expect("can get tag names").expect("if tag was listed it has a name"));
             }
         }
-        Command::SearchTags { tags } => {
+        Command::Tag(TagOp::Search(TagSearch::Name { exact, substr })) => {
+            for tag_id in hof.db.select_tags_with_name_like(exact, &substr).expect("can serach tags").into_iter() {
+                println!("{}", hof.db.tag_name(tag_id).expect("can get tag name").expect("if tag was found it has a name"));
+            }
+        }
+        Command::Tag(TagOp::Search(TagSearch::Value { exact, max_cardinality, substr })) => {
+            let max_cardinality = if max_cardinality != 0 {
+                Some(max_cardinality)
+            } else {
+                None
+            };
+
+            for (name, _, value) in hof.db.select_tags_with_value_like(exact, &substr, max_cardinality).expect("can search").into_iter() {
+                println!("{}: {}", name, value);
+            }
+        }
+        Command::Search { tags } => {
             let mut computed_tags = Vec::new();
             for t in tags.iter() {
                 match t.split_once("=") {

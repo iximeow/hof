@@ -289,6 +289,9 @@ enum SaveError {
 }
 
 async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Option<MaybeHashes>) -> Result<PathBuf, SaveError> {
+    // TODO: what if the interim file is the first in some directory tree that is not yet created?
+    // don't want to proactively create the tree if the file isn't fully received, but we should
+    // put it somewhere.... should interim files just be named uuids lol
     eprintln!("[.] interim file path: {:?}", paths.interim.display());
     let mut interim_file = match tokio::fs::File::options().read(true).write(true).create_new(true).open(&paths.interim).await {
         Ok(f) => f,

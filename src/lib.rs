@@ -462,6 +462,71 @@ mod db {
             Ok(worklist)
         }
 
+        pub fn select_tags_with_name_like(&self, exact: bool, substr: &str) -> Result<Vec<u64>, String> {
+            // TODO: sanitize out % in the search string
+            let (where_clause, param) = if exact {
+                ("name=?1", substr.to_owned())
+            } else {
+                ("name like ?1", format!("%{}%", substr))
+            };
+
+            let query = format!("select id from tags where {};", where_clause);
+            let conn = self.conn.lock().unwrap();
+            let mut res = Vec::new();
+
+            let mut stmt = conn.prepare(&query)
+                .map_err(|e| format!("unable to prepare query: {:?}", e))?;
+            let mut rows = stmt.query(params![param])
+                .map_err(|e| format!("unable to execute query: {:?}", e))?;
+
+            while let Ok(Some(row)) = rows.next() {
+                res.push(row.get(0).expect("can convert selected column to u64"));
+            }
+
+            Ok(res)
+        }
+
+        pub fn select_tags_with_value_like(&self, exact: bool, substr: &str, cardinality_limit: Option<u64>) -> Result<Vec<(String, u64, String)>, String> {
+            let mut params = Vec::new();
+            let mut where_clause = if exact {
+                params.push(substr.to_owned());
+                "file_tags.value=?1".to_owned()
+            } else {
+                params.push(format!("%{}%", substr));
+                "file_tags.value like ?1".to_owned()
+            };
+
+            let mut query = "select tags.name, file_tags.tag, file_tags.value from file_tags join tags on file_tags.tag=tags.id where ".to_string();
+            query.push_str(&where_clause);
+
+            if let Some(lim) = cardinality_limit {
+                let cardinality_filter = format!("file_tags.tag in (select distinct tag from file_tags where {} group by tag having count(distinct value) < {})", where_clause, lim);
+                query.push_str(" and ");
+                query.push_str(&cardinality_filter);
+            }
+
+            query.push_str(" group by file_tags.tag, file_tags.value;");
+
+            let conn = self.conn.lock().unwrap();
+
+            let mut stmt = conn.prepare(&query)
+                .map_err(|e| format!("unable to prepare query: {:?}", e))?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params))
+                .map_err(|e| format!("unable to execute query: {:?}", e))?;
+
+            let mut res = Vec::new();
+
+            while let Ok(Some(row)) = rows.next() {
+                res.push((
+                    row.get(0).expect("can convert selected column to String"),
+                    row.get(1).expect("can convert selected column to u64"),
+                    row.get(2).expect("can convert selected column to String"),
+                ));
+            }
+
+            Ok(res)
+        }
+
         pub fn select_by_tags<'query>(&'query self, tags: &[crate::TagFilter]) -> Result<Vec<u64>, String> {
             // TODO: extremely simple query logic:
             // * accept multiple tags, multiple values for each tag
