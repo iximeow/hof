@@ -293,6 +293,21 @@ async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Opti
     // don't want to proactively create the tree if the file isn't fully received, but we should
     // put it somewhere.... should interim files just be named uuids lol
     eprintln!("[.] interim file path: {:?}", paths.interim.display());
+    let interim_parent = paths.interim.clone();
+    if let Some(parent) = paths.interim.parent() {
+        match std::fs::create_dir_all(parent) {
+            Ok(()) => {
+                // great, directory's all set. now create the file that will live in it and move
+                // on.
+            }
+            Err(e) => {
+                // TODO: deal with the directory creation failing. is the filesystem busted? or
+                // something else?
+                eprintln!("[!] error creating parent directory: {}", parent.display());
+                return Err(SaveError::Conflict);
+            }
+        }
+    }
     let mut interim_file = match tokio::fs::File::options().read(true).write(true).create_new(true).open(&paths.interim).await {
         Ok(f) => f,
         Err(e) => {
