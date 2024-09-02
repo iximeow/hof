@@ -125,9 +125,12 @@ mod db {
             // any information about the file's theorized location somewhere should be retained as a tag on
             // the file instead.
             pub who: Option<String>,
+            pub collection_id: Option<u64>,
+            pub collection_name: Option<String>,
+            pub collection_base: Option<String>,
             // we may know someone has the file by some name, but not who or where. retain the name
             // for tracking purposes, but this is basically a dead reference..
-            pub replica: Option<String>,
+            pub path: Option<String>,
             pub valid: bool,
             pub last_check_ts: u64,
         }
@@ -193,7 +196,7 @@ mod db {
             conn.execute("\
                 CREATE INDEX IF NOT EXISTS file_tag_file_ids on file_tags (file_id);", params![]).unwrap();
             conn.execute("\
-                CREATE TABLE IF NOT EXISTS replicas (id INTEGER PRIMARY KEY, file_id INTEGER, who TEXT, replica TEXT, valid TINYINT, last_check INTEGER);", params![]).unwrap();
+                CREATE TABLE IF NOT EXISTS replicas (id INTEGER PRIMARY KEY, file_id INTEGER, who TEXT, collection_id INTEGER, path TEXT, valid TINYINT, last_check INTEGER);", params![]).unwrap();
             // each replica exists somewhere, replica_host describes a somewhere.
             // replica hosts might be a directory on a host, a disk, an ID for removable storage
             // (such as a disk), an s3, digitalocean, backblaze bucket name, a hostname, who knows.
@@ -215,7 +218,7 @@ mod db {
             // this isn't expressive enough! unfortunate. figure this out at some point. maybe each
             // replica needs a list of "access mechanism" or something..?
             conn.execute("\
-                CREATE TABLE IF NOT EXISTS replica_host (id INTEGER PRIMARY KEY, name TEXT, style TEXT, description TEXT, location TEXT);", params![]).unwrap();
+                CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY, name TEXT, style TEXT, description TEXT, location TEXT);", params![]).unwrap();
 
             conn.execute("\
                 CREATE TABLE IF NOT EXISTS acls (id INTEGER PRIMARY KEY, rule TEXT);", params![]).unwrap();
@@ -584,10 +587,59 @@ mod db {
             Ok(selected_files)
         }
 
+        // ohhhhhhhhhhhhhhhhhhhhh the replica table needs another unique constraint....
+        pub fn find_replica_by_names(&self, collection_name: &str, path: &str) -> Result<Option<data::Replica>, String> {
+            let hostname = gethostname::gethostname()
+                .into_string()
+                .expect("can turn hostname into string");
+
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare_cached("select who, collection_id, collections.name, collections.location, path, valid, last_check from replicas join collections on collections.id=replicas.collection_id where replicas.who=?1 and collections.name=?2 and replicas.path=?3;")
+                .map_err(|e| format!("unable to prepare query: {:?}", e))?;
+            let mut rows = stmt.query_map(params![hostname, collection_name, path], |row| {
+                let who: Option<String> = row.get(0).unwrap();
+                let collection_id: Option<u64> = row.get(1).unwrap();
+                let collection_name: Option<String> = row.get(2).unwrap();
+                let collection_base: Option<String> = row.get(3).unwrap();
+                let path: Option<String> = row.get(4).unwrap();
+                let valid: bool = row.get(5).unwrap();
+                let last_check: u64 = row.get(6).unwrap();
+                Ok((who, collection_id, collection_name, collection_base, path, valid, last_check))
+            })
+                .map_err(|e| format!("unable to execute query: {:?}", e))?;
+
+            let res = match rows.next() {
+                Some(Ok((who, collection_id, collection_name, collection_base, path, valid, last_check_ts))) => {
+                    data::Replica {
+                        who,
+                        collection_id,
+                        collection_name,
+                        collection_base,
+                        path,
+                        valid,
+                        last_check_ts,
+                    }
+                },
+                None => {
+                    return Ok(None);
+                }
+                Some(Err(e)) => {
+                    return Err(format!("some kind of query error: {}", e));
+                }
+            };
+
+            if rows.next().is_some() {
+                eprintln!("duplicate replicas for hostname={}/collection={}/path={}", hostname, collection_name, path);
+                return Err("multiple replicas for a specific hostname/collection/path lookup?".to_string());
+            }
+
+            Ok(Some(res))
+        }
+
         pub fn find_local_replica(&self, remote: &str, file_id: u64) -> Result<Option<String>, String> {
             let conn = self.conn.lock().unwrap();
             Ok(conn.query_row(
-                "select replica from replicas where who=?1 and file_id=?2 and valid=1",
+                "select path from replicas where who=?1 and file_id=?2 and valid=1",
                 params![remote, file_id],
                 |row| { row.get(0) }
             ).optional().unwrap())
@@ -798,7 +850,7 @@ mod db {
 
                     // we'll be simply trusting this replica to be added is currently valid...
                     let mut stmt = conn.prepare(
-                        "insert into replicas (file_id, who, replica, valid, last_check) values (?1, ?2, ?3, ?4, ?5);"
+                        "insert into replicas (file_id, who, path, valid, last_check) values (?1, ?2, ?3, ?4, ?5);"
                     ).expect("can prepare statement");
                     let rows_modified = stmt
                         .execute(params![file_id, host, replica_path, 1, now_ts]).unwrap();
@@ -940,21 +992,27 @@ mod db {
                 // CREATE TABLE IF NOT EXISTS file_tags (id INTEGER PRIMARY KEY, tag INTEGER, file_id INTEGER, source INTEGER, value TEXT);", params![]).unwrap();
                 // CREATE TABLE IF NOT EXISTS replicas (id INTEGER PRIMARY KEY, file_id INTEGER, who TEXT, replica TEXT, valid TINYINT, last_check INTEGER);", params![]).unwrap();
             let replicas_start = std::time::Instant::now();
-            let mut stmt = conn.prepare_cached("select who, replica, valid, last_check from replicas where file_id=?1;")
+            let mut stmt = conn.prepare_cached("select who, collection_id, collections.name, collections.location, path, valid, last_check from replicas join collections on collections.id=replicas.collection_id where file_id=?1;")
                 .map_err(|e| format!("unable to prepare query: {:?}", e))?;
             let mut rows = stmt.query_map(params![file_id], |row| {
                 let who: Option<String> = row.get(0).unwrap();
-                let replica: Option<String> = row.get(1).unwrap();
-                let valid: bool = row.get(2).unwrap();
-                let last_check: u64 = row.get(3).unwrap();
-                Ok((who, replica, valid, last_check))
+                let collection_id: Option<u64> = row.get(1).unwrap();
+                let collection_name: Option<String> = row.get(2).unwrap();
+                let collection_base: Option<String> = row.get(3).unwrap();
+                let path: Option<String> = row.get(4).unwrap();
+                let valid: bool = row.get(5).unwrap();
+                let last_check: u64 = row.get(6).unwrap();
+                Ok((who, collection_id, collection_name, collection_base, path, valid, last_check))
             })
                 .map_err(|e| format!("unable to execute query: {:?}", e))?;
 
-            while let Some(Ok((who, replica, valid, last_check_ts))) = rows.next() {
+            while let Some(Ok((who, collection_id, collection_name, collection_base, path, valid, last_check_ts))) = rows.next() {
                 description.replicas.push(data::Replica {
                     who,
-                    replica,
+                    collection_id,
+                    collection_name,
+                    collection_base,
+                    path,
                     valid,
                     last_check_ts,
                 });
@@ -1077,6 +1135,7 @@ pub struct Hof {
 pub struct Config {
     pub config_root: PathBuf,
     pub identity: ring::signature::Ed25519KeyPair,
+    pub default_replica: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1185,6 +1244,8 @@ impl Config {
         Ok(Config {
             config_root: config_path.to_path_buf(),
             identity: keypair,
+            // TODO: actually load this from somewhere
+            default_replica: None,
         })
     }
 
@@ -1301,15 +1362,21 @@ impl Hof {
             return Err("not this hostname");
         }
 
-        if let Some(path) = replica.replica.as_ref() {
-            match tokio::fs::File::open(path).await {
+        if let (Some(collection_base), Some(path)) = (replica.collection_base.as_ref(), replica.path.as_ref()) {
+            let path = format!("{}/{}", collection_base, path);
+            if path.contains("/../") {
+                eprintln!("replica {:?} yields potentially directory traversal path?", replica);
+                return Err("however that happened, no");
+            }
+            match tokio::fs::File::open(&path).await {
                 Ok(file) => { return Ok(file); },
                 Err(e) => {
+                    eprintln!("opening {} yielded {:?}", path, e);
                     return Err("tokio error opening file");
                 }
             }
         } else {
-            return Err("this hostname, but no path?");
+            return Err("this hostname, but collection has no base, or no path?");
         }
     }
 

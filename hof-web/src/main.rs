@@ -448,7 +448,36 @@ async fn handle_tag_file(Path(path): Path<String>, headers: HeaderMap, State(ctx
     StatusCode::OK.into_response()
 }
 
-async fn handle_download_file(Path(path): Path<String>, State(ctx): State<WebserverState>) -> impl IntoResponse {
+async fn handle_download_file_by_collection(Path((collection_name, path)): Path<(String, String)>, State(ctx): State<WebserverState>) -> impl IntoResponse {
+    let replica = match ctx.dbctx.db.find_replica_by_names(&collection_name, &path) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Html("Not Found".to_string())).into_response();
+        }
+        Err(e) => {
+            // TODO: don't really like logging random inputs here like this. escaping would be in
+            // order.
+            eprintln!("error issuing query `handle_download_file_by_collection({}, {})` returned {}", collection_name, path, e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    match ctx.dbctx.open_replica(&replica).await {
+        Ok(file) => {
+            let stream = tokio_util::io::ReaderStream::new(file);
+            let headers = [
+                (http::header::CONTENT_TYPE, "application/octet-stream"),
+            ];
+            return (headers, axum::body::Body::from_stream(stream)).into_response();
+        },
+        Err(e) => {
+            eprintln!("opening local replica {:?} resulted in {:?}", replica, e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+}
+
+async fn handle_download_file_by_id(Path(path): Path<String>, State(ctx): State<WebserverState>) -> impl IntoResponse {
     let file_id = if let Ok(id) = path.parse() {
         id
     } else {
@@ -502,8 +531,14 @@ async fn handle_describe_file(Path(path): Path<String>, State(ctx): State<Webser
     writeln!(html, "  md5:    {}", desc.md5.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
     writeln!(html, "replicas:");
     for replica in desc.replicas.iter() {
-        if let (Some(who), Some(path)) = (replica.who.as_ref(), replica.replica.as_ref()) {
-            write!(html, "  {}: {}, checked {}", who, path, replica.last_check_ts);
+        if let (Some(who), Some(path)) = (replica.who.as_ref(), replica.path.as_ref()) {
+            let collection_name = replica.collection_name.as_ref().unwrap();
+            write!(html, "  {}/{}: <a href=\"{}\">{}</a>, checked {}",
+                who, collection_name,
+                format!("/collections/{}/{}", collection_name, path).replace(" ", "%20"),
+                path,
+                replica.last_check_ts
+            );
             if replica.valid {
                 write!(html, " (valid)");
             }
@@ -637,8 +672,14 @@ async fn handle_search_tags(State(ctx): State<WebserverState>, RawQuery(q): RawQ
         write!(result_html, "  sha256: {}\n", desc.sha256.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
         write!(result_html, "replicas:\n");
         for replica in desc.replicas.iter() {
-            if let (Some(who), Some(path)) = (replica.who.as_ref(), replica.replica.as_ref()) {
-                write!(result_html, "  {}: {}, checked {}", who, path, replica.last_check_ts);
+            if let (Some(who), Some(path)) = (replica.who.as_ref(), replica.path.as_ref()) {
+                let collection_name = replica.collection_name.as_ref().unwrap();
+                write!(result_html, "  {}/{}: <a href=\"{}\">{}</a>, checked {}",
+                    who, collection_name,
+                    format!("/collections/{}/{}", collection_name, path).replace(" ", "%20"),
+                    path,
+                    replica.last_check_ts
+                );
                 if replica.valid {
                     write!(result_html, " (valid)");
                 }
@@ -731,10 +772,11 @@ async fn make_app_server(db_path: &PathBuf, config_path: &PathBuf, incoming_dir:
         .route("/", get(handle_tags_index))
         .route("/help", get(handle_help))
         .route("/file/:id", get(handle_describe_file))
-        .route("/file/:id/download", get(handle_download_file))
+        .route("/file/:id/download", get(handle_download_file_by_id))
         .route("/file/:id/tag", post(handle_tag_file))
         .route("/file/upload", post(handle_uploaded_file))
         .route("/tags/search", get(handle_search_tags))
+        .route("/collections/:collection/*path", get(handle_download_file_by_collection))
         .fallback(fallback_get)
         .with_state(WebserverState {
             dbctx: Arc::new(Hof::new(db_path, config_path)),

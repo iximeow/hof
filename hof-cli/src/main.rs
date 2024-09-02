@@ -21,8 +21,10 @@ struct Cli {
 enum Command {
     /// add _something_ to hof
     AddFile {
-        #[clap(long, short)]
-        recursive: Option<bool>,
+        #[clap(long, short, default_value_t = false)]
+        recursive: bool,
+        #[clap(long, default_value_t = false)]
+        intern: bool,
         what: String,
     },
 
@@ -274,12 +276,13 @@ fn main() {
         },
         Command::Config(Config::Remote { operation: RemoteConf::AlterToken { token, private_ok }}) => {
         },
-        Command::AddFile { what, recursive } => {
-            match recursive {
-                Some(true) => {
-                    panic!("recursive add not supported yet");
-                },
-                _ => {
+        Command::AddFile { what, intern, recursive } => {
+            if recursive {
+                panic!("recursive add not supported yet");
+            } else {
+                if intern {
+                    // hof.intern_file(what).expect("works");
+                } else {
                     hof.add_file(what).expect("works");
                 }
             }
@@ -477,7 +480,7 @@ fn main() {
                 let mut path = None;
                 for replica in desc.replicas.iter() {
                     if replica.valid && replica.who.as_ref() == Some(&hostname) {
-                        if let Some(replica_path) = replica.replica.as_ref() {
+                        if let Some(replica_path) = replica.path.as_ref() {
                             match std::fs::metadata(&replica_path) {
                                 Ok(md) => {
                                     if md.is_file() {
@@ -538,6 +541,29 @@ fn main() {
 
                 headers.insert("auth", HeaderValue::from_str("trustme").expect("valid value"));
 
+                // TODO: lookup procedure for "dest"
+                //
+                // problems:
+                // * i may want to replicate to `astronomy_storage`, wherever that is. just
+                // replicate to it. go.
+                //   - the exact replication strategy for `astronomy_storage` may be fuzzier:
+                //      "store on this disk, that disk, and backblaze"
+                // * i may want to replicate specifically to `www.iximeow.net`. `www.iximeow.net`
+                //   might even call the collection some name i don't know. i don't really care,
+                //   just put the data there.
+                // * i may want to replicate to one specific collection on ivorytower. not to all,
+                //   and definitely not to an arbtrarily chosen one.
+                //
+                // i think this means the resolution procedure is:
+                // * for collections like `astronomy_storage`, the collection's replication
+                // strategy and internal details are tracked elsewhere. perhaps part of the
+                // collection type? at which point i pick the "best" mirror by some metric and
+                // replicate to it.
+                // * for collections like `www.iximeow.net`. the remote should have a default
+                // replica. we just need to look up the name. we don't need to know the default
+                // destination replica.
+                // * easiest case: replicate to the host and tell it it can pick where to put the
+                // data. this likely means interning it.
                 let dest_addr = hof.cfg.lookup_remote_addr(&dest).expect("TODO: works").unwrap_or_else(|| dest.clone());
 
                 eprintln!("[i] headers: {:?}", headers);
@@ -661,7 +687,18 @@ fn print_description(desc: &hofvarpnir::Description) {
     println!("  md5:    {}", desc.md5.as_ref().map(|x| x.as_str()).unwrap_or("<null>"));
     println!("replicas:");
     for replica in desc.replicas.iter() {
-        if let Some(replica_name) = replica.replica.as_ref() {
+        if let Some(collection_id) = replica.collection_id.as_ref() {
+            if let Some(path) = replica.path.as_ref() {
+                print!("  collection {} ({}), path={}", replica.collection_name.as_ref().unwrap(), collection_id, path);
+                if let Some(base) = replica.collection_base.as_ref() {
+                    let base = base.strip_suffix("/").unwrap_or(base);
+                    let path = path.strip_prefix("/").unwrap_or(path);
+                    print!("\n    full path: {}/{}", base, path);
+                }
+            } else {
+                print!("  collection {}, no path?", replica.collection_name.as_ref().unwrap());
+            }
+        } else if let Some(replica_name) = replica.path.as_ref() {
             if let Some(who) = replica.who.as_ref() {
                 print!("  {}: {}, checked {}", who, replica_name, replica.last_check_ts);
                 if replica.valid {
