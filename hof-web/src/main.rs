@@ -32,7 +32,8 @@ struct WebserverConfig {
     debug_addr: Option<serde_json::Value>,
     db_path: PathBuf,
     config_path: PathBuf,
-    incoming_dir: PathBuf,
+    // incoming_dir: PathBuf,
+    default_collection: String,
 }
 
 struct Auth {
@@ -42,6 +43,14 @@ struct Auth {
 }
 
 impl Auth {
+    fn from_token(token: &hofvarpnir::Token) -> Self {
+        Auth  {
+            can_read: true,
+            can_write: token.write_ok,
+            visibility: token.administrative,
+        }
+    }
+
     fn all() -> Self {
         Auth {
             can_read: true,
@@ -66,10 +75,18 @@ impl FromRequestParts<WebserverState> for Auth {
     async fn from_request_parts(parts: &mut Parts, state: &WebserverState) -> Result<Self, Self::Rejection> {
         match get_one_header(&parts.headers, "auth") {
             Some(value) => {
-                if value == "trustme" {
-                    Ok(Auth::all())
-                } else {
-                    Err((StatusCode::BAD_REQUEST, "bad auth"))
+                match state.dbctx.db.lookup_token(value) {
+                    Ok(Some(token)) => {
+                        state.dbctx.db.refresh_token(&token).expect("can refresh token");
+                        Ok(Auth::from_token(&token))
+                    },
+                    Ok(None) => {
+                        Err((StatusCode::FORBIDDEN, "bad auth"))
+                    },
+                    Err(e) => {
+                        eprintln!("auth failure: {:?}", e);
+                        Err((StatusCode::BAD_REQUEST, "bad auth"))
+                    }
                 }
             }
             None => {
@@ -92,10 +109,10 @@ async fn main() {
     ).expect("valid json for WebserverConfig");
     let db_path = web_config.db_path.clone();
     let config_path = web_config.config_path.clone();
-    let incoming_dir = web_config.incoming_dir.clone();
+    let default_collection = web_config.default_collection.clone();
 
     if let Some(addr_conf) = web_config.debug_addr.as_ref() {
-        tokio::spawn(bind_server(addr_conf.clone(), db_path.clone(), config_path.clone(), incoming_dir.clone()));
+        tokio::spawn(bind_server(addr_conf.clone(), db_path.clone(), config_path.clone(), default_collection.clone()));
     }
 
     loop {
@@ -128,7 +145,7 @@ async fn handle_help(State(ctx): State<WebserverState>) -> impl IntoResponse {
 
 struct FilePaths {
     target: Option<PathBuf>,
-    target_base: PathBuf,
+    target_collection: String,
     interim: PathBuf,
 }
 
@@ -227,17 +244,18 @@ async fn handle_uploaded_file(auth: Auth, headers: HeaderMap, State(ctx): State<
             // create both files atomically to error early if either is a conflict. error
             // resolution is a little subtle, described later.
 
-            let mut target_path = ctx.incoming_dir.clone();
-            target_path.push(desired_path);
+            let mut target_path: PathBuf = desired_path.into();
             eprintln!("want to save to {}", target_path.display());
 
             let mut interim_path = target_path.clone();
             let last_part = interim_path.pop();
             let interim_path = interim_path.join(&format!("{}.hofpart", last_part));
 
+            // let hashes_id = ctx.dbctx.db.find_by_hash(&maybe_hashes);
+
             FilePaths {
                 target: Some(target_path),
-                target_base: ctx.incoming_dir.clone(),
+                target_collection: ctx.default_collection.clone(),
                 interim: interim_path,
             }
         }
@@ -257,17 +275,50 @@ async fn handle_uploaded_file(auth: Auth, headers: HeaderMap, State(ctx): State<
             let interim_path = "test.hofpart".into();
             FilePaths {
                 target: None,
-                target_base: ctx.incoming_dir.clone(),
+                target_collection: ctx.default_collection.clone(),
                 interim: interim_path,
             }
         }
     };
 
-    match save_file(body, &file_paths, maybe_hashes).await {
+    let collection_name = file_paths.target_collection.as_str();
+    let dest_collection = match ctx.dbctx.db.lookup_collection(collection_name) {
+        Ok(Some(collection)) => { collection },
+        Ok(None) => {
+            eprintln!("default collection name {} does not reference a collection?", collection_name);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(e) => {
+            eprintln!("looked up default collection {}, got {:?}", collection_name, e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    match save_file(&dest_collection, body, &file_paths, maybe_hashes).await {
         Ok(final_path) => {
             // ok! we've saved the file. now we can insert it into the db...
-            let id = ctx.dbctx.add_file(final_path)
+            let id = ctx.dbctx.add_file(final_path.clone())
                 .expect("can add file");
+            if dest_collection.style.as_str() == "hams" {
+                let hams_path_tag = match ctx.dbctx.db.create_tag("hams:path") {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("added file but failed to find hams:path tag: file={}, tag error={:?}", final_path.display(), e);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+                let manual_id = match ctx.dbctx.db.get_tag_generator_manual_id() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("added file but failed to find manual source id: path tag: file={}, tag error={:?}", final_path.display(), e);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+                if let Err(e) = ctx.dbctx.db.add_tag(id, manual_id, hams_path_tag, &format!("{}", final_path.display())) {
+                    eprintln!("added file but failed to add tag: file={}, tag error={:?}", final_path.display(), e);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
 //            eprintln!("pretend i just added {} to the db", final_path.display());
             (StatusCode::OK, Html(id.to_string())).into_response()
         },
@@ -288,7 +339,7 @@ enum SaveError {
     Other(String),
 }
 
-async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Option<MaybeHashes>) -> Result<PathBuf, SaveError> {
+async fn save_file(dest_collection: &hofvarpnir::Collection, body: axum::body::Body, paths: &FilePaths, maybe_hashes: Option<MaybeHashes>) -> Result<PathBuf, SaveError> {
     // TODO: what if the interim file is the first in some directory tree that is not yet created?
     // don't want to proactively create the tree if the file isn't fully received, but we should
     // put it somewhere.... should interim files just be named uuids lol
@@ -380,11 +431,21 @@ async fn save_file(body: axum::body::Body, paths: &FilePaths, maybe_hashes: Opti
     // at this point if there were hashes, they match what we got. if we didn't know a path to put
     // this before, we can compute one: the sha256 of the file.
     let dest_path: PathBuf = match paths.target.as_ref() {
-        Some(target) => target.clone(),
+        Some(target) => {
+            if dest_collection.style.as_str() == "filesystem" {
+                dest_collection.location.join(target)
+            } else {
+                let hash = hex::encode(hashes.sha256);
+                dest_collection.location
+                    .join(&hash[0..2])
+                    .join(&hash[2..4])
+                    .join(&hash[4..])
+            }
+        },
         None => {
             // TODO: at last split this by the first byte, or two bytes, so they all don't go in
             // the same directory...
-            paths.target_base.join(hex::encode(hashes.sha256))
+            dest_collection.location.join(hex::encode(hashes.sha256))
         }
     };
 
@@ -764,10 +825,10 @@ async fn handle_tags_index(State(ctx): State<WebserverState>) -> impl IntoRespon
 #[derive(Clone)]
 struct WebserverState {
     dbctx: Arc<Hof>,
-    incoming_dir: PathBuf
+    default_collection: String
 }
 
-async fn make_app_server(db_path: &PathBuf, config_path: &PathBuf, incoming_dir: PathBuf) -> Router {
+async fn make_app_server(db_path: &PathBuf, config_path: &PathBuf, default_collection: String) -> Router {
     Router::new()
         .route("/", get(handle_tags_index))
         .route("/help", get(handle_help))
@@ -780,12 +841,12 @@ async fn make_app_server(db_path: &PathBuf, config_path: &PathBuf, incoming_dir:
         .fallback(fallback_get)
         .with_state(WebserverState {
             dbctx: Arc::new(Hof::new(db_path, config_path)),
-            incoming_dir,
+            default_collection,
         })
 }
 
-async fn bind_server(conf: serde_json::Value, db_path: PathBuf, config_path: PathBuf, incoming_dir: PathBuf) -> std::io::Result<()> {
-    let server = make_app_server(&db_path, &config_path, incoming_dir).await.into_make_service();
+async fn bind_server(conf: serde_json::Value, db_path: PathBuf, config_path: PathBuf, default_collection: String) -> std::io::Result<()> {
+    let server = make_app_server(&db_path, &config_path, default_collection).await.into_make_service();
 
     use serde_json::Value;
     match conf {

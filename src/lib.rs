@@ -91,11 +91,11 @@ trait Database {
     fn add_tag(&self, hash: String, tag: Tag) -> Result<(), ()>;
 }
 
-pub use db::data::{Description, PathLookup};
+pub use db::data::{Collection, Description, PathLookup, Token};
 
 mod db {
     use rusqlite::{params, Connection, OptionalExtension};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     pub mod audit {
@@ -111,6 +111,8 @@ mod db {
     }
 
     pub mod data {
+        use std::path::PathBuf;
+
         pub enum PathLookup {
             Exact(String),
             Prefix(String),
@@ -148,6 +150,26 @@ mod db {
             pub md5: Option<String>,
             pub replicas: Vec<Replica>,
             pub tags: Vec<Tag>,
+        }
+
+        pub struct Token {
+            pub id: u32,
+            pub token: String,
+            pub pubkey_id: u32,
+            pub not_after: u64,
+            pub issued_at: u64,
+            pub private_ok: bool,
+            pub write_ok: bool,
+            pub revoked: bool,
+            pub administrative: bool,
+        }
+
+        pub struct Collection {
+            pub id: u32,
+            pub name: String,
+            pub style: String,
+            pub description: String,
+            pub location: PathBuf,
         }
     }
 
@@ -244,7 +266,7 @@ mod db {
                 CREATE UNIQUE INDEX IF NOT EXISTS key_uniqueness on pubkeys (key);", params![]).unwrap();
             // no real acl logic yet, just a bool for if the token is allowed to see `adhoc:access=private` files
             conn.execute("\
-                CREATE TABLE IF NOT EXISTS tokens (id INTEGER PRIMARY KEY, token TEXT, pubkey INTEGER, not_after INTEGER, issued_at INTEGER, private_ok BOOL, revoked BOOL, administrative BOOL);", params![]).unwrap();
+                CREATE TABLE IF NOT EXISTS tokens (id INTEGER PRIMARY KEY, token TEXT, pubkey INTEGER, not_after INTEGER, issued_at INTEGER, private_ok BOOL, write_ok BOOL, revoked BOOL, administrative BOOL);", params![]).unwrap();
             conn.execute("\
                 CREATE UNIQUE INDEX IF NOT EXISTS token_uniqueness on tokens (token);", params![]).unwrap();
             conn.execute("\
@@ -272,7 +294,111 @@ mod db {
                 }
             };
 
+            // TODO: record audit events
+
             Ok(())
+        }
+
+        pub fn lookup_collection(&self, collection_name: &str) -> Result<Option<data::Collection>, String> {
+            let conn = self.conn.lock().unwrap();
+
+            let mut stmt = conn.prepare_cached("select id, name, style, description, location from collections where name=?1;")
+                .map_err(|e| format!("unable to prepare query: {:?}", e))?;
+            let mut rows = stmt.query_map(params![collection_name], |row| {
+                let id: u32 = row.get(0).unwrap();
+                let name: String = row.get(1).unwrap();
+                let style: String = row.get(2).unwrap();
+                let description: String = row.get(3).unwrap();
+                let location: String = row.get(4).unwrap();
+                let location: PathBuf = location.into();
+                Ok(data::Collection {
+                    id,
+                    name,
+                    style,
+                    description,
+                    location,
+                })
+            })
+                .map_err(|e| format!("unable to execute query: {:?}", e))?;
+
+            match rows.next() {
+                Some(Ok(collection)) => {
+                    if rows.next().is_some() {
+                        return Err(format!("multiple collections for {}?", collection_name));
+                    }
+
+                    Ok(Some(collection))
+                },
+                Some(Err(e)) => {
+                    return Err(format!("query error: {:?}", e));
+                }
+                None => {
+                    Ok(None)
+                }
+            }
+        }
+
+        pub fn lookup_token(&self, token_str: &str) -> Result<Option<data::Token>, String> {
+            let conn = self.conn.lock().unwrap();
+
+            let mut stmt = conn.prepare_cached("select id, token, pubkey, not_after, issued_at, private_ok, write_ok, revoked, administrative from tokens where token=?1;")
+                .map_err(|e| format!("unable to prepare query: {:?}", e))?;
+            let mut rows = stmt.query_map(params![token_str], |row| {
+                let id: u32 = row.get(0).unwrap();
+                let token: String = row.get(1).unwrap();
+                let pubkey_id: u32 = row.get(2).unwrap();
+                let not_after: u64 = row.get(3).unwrap();
+                let issued_at: u64 = row.get(4).unwrap();
+                let private_ok: bool = row.get(5).unwrap();
+                let write_ok: bool = row.get(6).unwrap();
+                let revoked: bool = row.get(7).unwrap();
+                let administrative: bool = row.get(8).unwrap();
+                Ok(data::Token {
+                    id,
+                    token,
+                    pubkey_id,
+                    not_after,
+                    issued_at,
+                    private_ok,
+                    write_ok,
+                    revoked,
+                    administrative,
+                })
+            })
+                .map_err(|e| format!("unable to execute query: {:?}", e))?;
+
+            match rows.next() {
+                Some(Ok(token)) => {
+                    if rows.next().is_some() {
+                        return Err(format!("multiple tokens for {}?", token_str));
+                    }
+
+                    Ok(Some(token))
+                },
+                Some(Err(e)) => {
+                    return Err(format!("query error: {:?}", e));
+                }
+                None => {
+                    Ok(None)
+                }
+            }
+        }
+
+        pub fn refresh_token(&self, token: &data::Token) -> Result<(), String> {
+            let conn = self.conn.lock().unwrap();
+
+            let now = crate::now_ms();
+            // rough idea: expire a token if it has not been used in a month.
+            let not_after = now + 1000 * 3600 * 24 * 30;
+
+            let res = conn.execute(
+                "update tokens set not_after=?1 where id=?2 and revoked=0;",
+                params![not_after, token.id],
+            );
+
+            res
+                .map(|rows| assert_eq!(rows, 1))
+                .map_err(|e| format!("failed to update: {:?}", e))
         }
 
         pub fn create_token(&self, pubkey: u64, private_ok: bool) -> Result<String, String> {
@@ -286,10 +412,10 @@ mod db {
             let not_after = now + 1000 * 3600 * 24 * 30;
 
             let insert_res = conn.execute(
-                "insert into tokens (token, pubkey, not_after, issued_at, private_ok, revoked, administrative) values (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
-                // not for private access, not revoked, and definitely not administrative by
-                // default.
-                params![token, pubkey, not_after, issued_at, false, false, false],
+                "insert into tokens (token, pubkey, not_after, issued_at, private_ok, write_ok, revoked, administrative) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+                // not for private access, not for writing, not revoked, and definitely not
+                // administrative by default.
+                params![token, pubkey, not_after, issued_at, false, false, false, false],
             );
 
             match insert_res {
@@ -334,6 +460,37 @@ mod db {
                 }
                 Err(rusqlite::Error::SqliteFailure(sql_err, _)) if sql_err.code == rusqlite::ErrorCode::ConstraintViolation => {
                     Err("already exists".to_string())
+                }
+                Err(e) => {
+                    panic!("unexpected err: {:?}", e);
+                }
+            }
+        }
+
+        pub fn get_tag_generator_manual_id(&self) -> Result<u64, String> {
+            let name = "manual";
+            let version = Option::<u32>::None;
+
+            let conn = self.conn.lock().unwrap();
+            let insert_res = conn.execute(
+                "insert into tag_sources (name, version) values (?1, ?2);",
+                params![name, version]
+            );
+
+            match insert_res {
+                Ok(1) => {
+                    // inserted onw item, so that's the new id.
+                    Ok(conn.last_insert_rowid() as u64)
+                }
+                Ok(rows) => {
+                    unreachable!("attempted to insert one row, actually inserted .... {} ???", rows);
+                }
+                Err(rusqlite::Error::SqliteFailure(sql_err, _)) if sql_err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                    Ok(conn.query_row(
+                        "select id from tag_sources where name=?1 and version=?2",
+                        params![name, version],
+                        |row| { row.get(0) }
+                    ).unwrap())
                 }
                 Err(e) => {
                     panic!("unexpected err: {:?}", e);
